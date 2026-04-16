@@ -30,7 +30,7 @@ module.exports = { value: 'foo' };
 When bundled, it produces:
 
 ```js
-// #region rolldown:runtime
+// #region \0rolldown/runtime.js
 // ...runtime code
 // #endregion
 
@@ -68,7 +68,7 @@ module.exports = { value: 'foo' };
 Bundled output:
 
 ```js
-// #region rolldown:runtime
+// #region \0rolldown/runtime.js
 // ...runtime code
 // #endregion
 
@@ -199,6 +199,12 @@ This code will print `foo` in both interpretations. Note that TypeScript may sho
 If you find an issue that seems to be caused by this incompatibility, try using [publint](https://publint.dev/) to check the package. It has [a rule that detects the incompatibility](https://publint.dev/rules#cjs_with_esmodule_default_export) (note that it only checks some of the files in the package, not all of them).
 
 If the heuristic is not working for you, you can use the code in the section above that handles both interpretations. If the import is in a dependency, we recommend to raise an issue to the dependency. In the meantime, you can use [`patch-package`](https://github.com/ds300/patch-package) or [`pnpm patch`](https://pnpm.io/cli/patch) or alternatives as an escape hatch.
+
+### Strict Mode Applied to `.js` files
+
+For files ending with `.js`, Rolldown parses the file as ESM ([#7009](https://github.com/rolldown/rolldown/issues/7009)) without falling back to CJS. This means that syntaxes only allowed in non-strict mode (sloppy mode) will be rejected.
+
+For now, you can change the file extension to `.cjs` as a workaround.
 
 ## Future Plans
 

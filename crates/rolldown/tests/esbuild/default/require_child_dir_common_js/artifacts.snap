@@ -6,15 +6,11 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## entry.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-//#region dir/index.js
-var require_dir = /* @__PURE__ */ __commonJSMin(((exports, module) => {
-	module.exports = 123;
-}));
-
-//#endregion
+// HIDDEN [\0rolldown/runtime.js]
 //#region entry.js
-console.log(require_dir());
-
+console.log((/* @__PURE__ */ __commonJSMin(((exports, module) => {
+	module.exports = 123;
+})))());
 //#endregion
+
 ```

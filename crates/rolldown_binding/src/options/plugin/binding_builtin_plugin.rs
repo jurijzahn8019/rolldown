@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use napi::{Unknown, bindgen_prelude::FromNapiValue};
 use rolldown_plugin::__inner::Pluginable;
+use rolldown_plugin_bundle_analyzer::BundleAnalyzerPlugin;
 use rolldown_plugin_esm_external_require::EsmExternalRequirePlugin;
 use rolldown_plugin_isolated_declaration::IsolatedDeclarationPlugin;
+use rolldown_plugin_oxc_runtime::OxcRuntimePlugin;
 use rolldown_plugin_replace::ReplacePlugin;
 use rolldown_plugin_vite_alias::ViteAliasPlugin;
 use rolldown_plugin_vite_build_import_analysis::ViteBuildImportAnalysisPlugin;
@@ -18,12 +20,11 @@ use rolldown_plugin_vite_reporter::ViteReporterPlugin;
 use rolldown_plugin_vite_resolve::ViteResolvePlugin;
 use rolldown_plugin_vite_transform::ViteTransformPlugin;
 use rolldown_plugin_vite_wasm_fallback::ViteWasmFallbackPlugin;
-use rolldown_plugin_vite_wasm_helper::ViteWasmHelperPlugin;
 use rolldown_plugin_vite_web_worker_post::ViteWebWorkerPostPlugin;
 
 use crate::options::plugin::config::{
-  BindingEsmExternalRequirePluginConfig, BindingViteModulePreloadPolyfillPluginConfig,
-  BindingViteReactRefreshWrapperPluginConfig, BindingViteWasmHelperPluginConfig,
+  BindingBundleAnalyzerPluginConfig, BindingEsmExternalRequirePluginConfig,
+  BindingViteModulePreloadPolyfillPluginConfig, BindingViteReactRefreshWrapperPluginConfig,
 };
 
 use super::{
@@ -59,6 +60,14 @@ impl TryFrom<BindingBuiltinPlugin<'_>> for Arc<dyn Pluginable> {
 
   fn try_from(plugin: BindingBuiltinPlugin) -> Result<Self, Self::Error> {
     Ok(match plugin.__name {
+      BindingBuiltinPluginName::BundleAnalyzer => {
+        let plugin = if let Some(options) = plugin.options {
+          BindingBundleAnalyzerPluginConfig::from_unknown(options)?.into()
+        } else {
+          BundleAnalyzerPlugin::default()
+        };
+        Arc::new(plugin)
+      }
       BindingBuiltinPluginName::EsmExternalRequire => {
         let plugin = if let Some(options) = plugin.options {
           BindingEsmExternalRequirePluginConfig::from_unknown(options)?.into()
@@ -188,15 +197,8 @@ impl TryFrom<BindingBuiltinPlugin<'_>> for Arc<dyn Pluginable> {
         Arc::new(plugin)
       }
       BindingBuiltinPluginName::ViteWasmFallback => Arc::new(ViteWasmFallbackPlugin),
-      BindingBuiltinPluginName::ViteWasmHelper => {
-        let plugin = if let Some(options) = plugin.options {
-          BindingViteWasmHelperPluginConfig::from_unknown(options)?.into()
-        } else {
-          ViteWasmHelperPlugin::default()
-        };
-        Arc::new(plugin)
-      }
       BindingBuiltinPluginName::ViteWebWorkerPost => Arc::new(ViteWebWorkerPostPlugin),
+      BindingBuiltinPluginName::OxcRuntime => Arc::new(OxcRuntimePlugin),
     })
   }
 }

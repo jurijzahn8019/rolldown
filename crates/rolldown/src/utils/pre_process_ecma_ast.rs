@@ -5,14 +5,18 @@ use oxc::ast_visit::VisitMut;
 use oxc::diagnostics::Severity as OxcSeverity;
 use oxc::minifier::{CompressOptions, Compressor, TreeShakeOptions};
 use oxc::semantic::{Scoping, SemanticBuilder, Stats};
+use oxc::syntax::symbol::SymbolFlags;
 use oxc::transformer::Transformer;
 use oxc::transformer_plugins::{
   InjectGlobalVariables, ReplaceGlobalDefines, ReplaceGlobalDefinesConfig,
 };
+use oxc_str::CompactStr;
 
-use rolldown_common::NormalizedBundlerOptions;
+use rolldown_common::{ConstExportMeta, ConstantValue, NormalizedBundlerOptions};
 use rolldown_ecmascript::{EcmaAst, WithMutFields};
+use rolldown_ecmascript_utils::contains_script_closing_tag;
 use rolldown_error::{BatchedBuildDiagnostic, BuildDiagnostic, BuildResult, EventKind, Severity};
+use rustc_hash::FxHashMap;
 
 use crate::types::oxc_parse_type::OxcParseType;
 
@@ -59,7 +63,7 @@ impl PreProcessEcmaAst {
 
     // Step 1: Build initial semantic data and check for semantic errors.
     let semantic_ret = ast.program.with_dependent(|_owner, dep| {
-      SemanticBuilder::new().with_check_syntax_error(true).build(&dep.program)
+      SemanticBuilder::new().with_check_syntax_error(true).with_enum_eval(true).build(&dep.program)
     });
 
     let (errors, warnings): (Vec<_>, Vec<_>) =
@@ -86,6 +90,49 @@ impl PreProcessEcmaAst {
     self.stats = semantic_ret.semantic.stats();
     let mut scoping = Some(semantic_ret.semantic.into_scoping());
 
+    // Extract enum member values before the transformer converts enums.
+    // This runs before Step 3 (transformer) because `optimize_const_enums` / `optimize_enums`
+    // remove or rewrite enum declarations, making member values unrecoverable afterward.
+    //
+    // Both const and regular enums are extracted so member accesses can be inlined.
+    // Tree-shaking in `include_statements.rs` skips including the enum declaration
+    // when a member access will be inlined. Regular enum IIFEs are `@__PURE__`, so
+    // they are naturally tree-shaken if no other references keep them alive.
+    let enum_member_value_map = {
+      let scoping_ref = scoping.as_mut().unwrap();
+      let mut enum_values: FxHashMap<CompactStr, FxHashMap<CompactStr, ConstExportMeta>> =
+        FxHashMap::default();
+
+      // Walk enum declarations → body scopes → member bindings to collect values.
+      for symbol_id in scoping_ref.symbol_ids() {
+        let flags = scoping_ref.symbol_flags(symbol_id);
+        if !(flags.is_const_enum() || flags.contains(SymbolFlags::RegularEnum)) {
+          continue;
+        }
+        let Some(body_scopes) = scoping_ref.get_enum_body_scopes(symbol_id) else { continue };
+        let members =
+          enum_values.entry(CompactStr::from(scoping_ref.symbol_name(symbol_id))).or_default();
+
+        for &body_scope in body_scopes {
+          for (member_name, &member_sym) in scoping_ref.get_bindings(body_scope) {
+            if let Some(value) = scoping_ref.get_enum_member_value(member_sym) {
+              let rolldown_value = match value {
+                oxc::syntax::constant_value::ConstantValue::Number(n) => ConstantValue::Number(*n),
+                oxc::syntax::constant_value::ConstantValue::String(s) => {
+                  ConstantValue::String(s.to_string())
+                }
+              };
+              members.insert(
+                CompactStr::from(member_name.as_str()),
+                ConstExportMeta::new(rolldown_value, false),
+              );
+            }
+          }
+        }
+      }
+      enum_values
+    };
+
     // Step 2: Run define plugin.
     if let Some(replace_global_define_config) = replace_global_define_config {
       ast.program.with_mut(|WithMutFields { program, allocator, .. }| {
@@ -100,11 +147,11 @@ impl PreProcessEcmaAst {
     // Step 3: Transform TypeScript and jsx.
     // Note: Currently, oxc_transform supports es syntax up to ES2024 (unicode-sets-regex).
     let is_not_js = !matches!(parsed_type, OxcParseType::Js);
-
+    let mut preserve_jsx = false;
     if is_not_js
       || bundle_options.transform_options.should_transform_js()
       // Run transformer on JS files containing `</script` to handle tagged template literals.
-      || memchr::memmem::find(ast.source().as_bytes(), "</script".as_bytes()).is_some()
+      || contains_script_closing_tag(ast.source().as_bytes())
     {
       ast.program.with_mut(|WithMutFields { program, allocator, .. }| {
         // Pass file path only for non-JS modules (TS/TSX/JSX) to enable tsconfig discovery.
@@ -112,6 +159,9 @@ impl PreProcessEcmaAst {
         let transform_options = bundle_options
           .transform_options
           .options_for_file(is_not_js.then_some(Path::new(resolved_id)), &mut warnings)?;
+        if !transform_options.jsx.jsx_plugin {
+          preserve_jsx = true;
+        }
 
         let scoping = self.recreate_scoping(&mut scoping, program);
         let ret = Transformer::new(allocator, Path::new(stable_id), &transform_options)
@@ -156,10 +206,12 @@ impl PreProcessEcmaAst {
     if bundle_options.treeshake.is_some() && !has_lazy_export {
       ast.program.with_mut(|WithMutFields { program, allocator, .. }| {
         let scoping = self.recreate_scoping(&mut scoping, program);
+        let mut treeshake = TreeShakeOptions::from(&bundle_options.treeshake);
+        treeshake.invalid_import_side_effects = true;
         // NOTE: `CompressOptions::dead_code_elimination` will remove `ParenthesizedExpression`s from the AST.
         let options = CompressOptions {
           target: bundle_options.transform_options.target.clone(),
-          treeshake: TreeShakeOptions::from(&bundle_options.treeshake),
+          treeshake,
           ..CompressOptions::dce()
         };
         Compressor::new(allocator).dead_code_elimination_with_scoping(program, scoping, options);
@@ -173,7 +225,14 @@ impl PreProcessEcmaAst {
       self.recreate_scoping(&mut None, program)
     });
 
-    Ok(ParseToEcmaAstResult { ast, scoping, has_lazy_export, warnings })
+    Ok(ParseToEcmaAstResult {
+      ast,
+      scoping,
+      has_lazy_export,
+      warnings,
+      preserve_jsx,
+      enum_member_value_map,
+    })
   }
 
   fn recreate_scoping(&mut self, scoping: &mut Option<Scoping>, program: &Program<'_>) -> Scoping {

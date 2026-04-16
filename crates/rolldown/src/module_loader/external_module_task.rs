@@ -2,19 +2,22 @@ use std::{path::Path, sync::Arc};
 
 use arcstr::ArcStr;
 use rolldown_common::{
-  ExternalModuleTaskResult, ModuleIdx, ModuleInfo, ModuleLoaderMsg, ResolvedExternal, ResolvedId,
+  ExportsKind, ExternalModuleTaskResult, ModuleIdx, ModuleInfo, ModuleLoaderMsg, ResolvedExternal,
+  ResolvedId,
 };
 use rolldown_error::BuildResult;
 use rolldown_utils::{ecmascript::legitimize_identifier_name, indexmap::FxIndexSet};
 use sugar_path::SugarPath;
+
+use rolldown_fs::FileSystem;
 
 use crate::ecmascript::ecma_module_view_factory::normalize_side_effects;
 
 use super::task_context::TaskContext;
 
 #[expect(clippy::rc_buffer)]
-pub struct ExternalModuleTask {
-  ctx: Arc<TaskContext>,
+pub struct ExternalModuleTask<Fs: FileSystem> {
+  ctx: Arc<TaskContext<Fs>>,
   module_idx: ModuleIdx,
   resolved_id: ResolvedId,
   user_defined_entries: Arc<Vec<(Option<ArcStr>, ResolvedId)>>,
@@ -22,9 +25,9 @@ pub struct ExternalModuleTask {
 }
 
 #[expect(clippy::rc_buffer)]
-impl ExternalModuleTask {
+impl<Fs: FileSystem> ExternalModuleTask<Fs> {
   pub fn new(
-    ctx: Arc<TaskContext>,
+    ctx: Arc<TaskContext<Fs>>,
     idx: ModuleIdx,
     resolved_id: ResolvedId,
     user_defined_entries: Arc<Vec<(Option<ArcStr>, ResolvedId)>>,
@@ -47,7 +50,7 @@ impl ExternalModuleTask {
   async fn run_inner(&self) -> BuildResult<()> {
     let resolved_id = &self.resolved_id;
     let external_module_side_effects =
-      normalize_side_effects(&self.ctx.options, resolved_id, None, None, resolved_id.side_effects)
+      normalize_side_effects(&self.ctx.options, resolved_id, None, resolved_id.side_effects)
         .await?;
     let id = resolved_id.id.clone();
     self.ctx.plugin_driver.set_module_info(
@@ -61,6 +64,7 @@ impl ExternalModuleTask {
         imported_ids: FxIndexSet::default(),
         dynamically_imported_ids: FxIndexSet::default(),
         exports: vec![],
+        input_format: ExportsKind::None,
       }),
     );
 

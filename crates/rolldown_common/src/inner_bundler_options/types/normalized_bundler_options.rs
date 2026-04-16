@@ -11,6 +11,7 @@ use rolldown_error::EventKindSwitcher;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::code_splitting_mode::CodeSplittingMode;
+use super::comments::CommentsOptions;
 use super::experimental_options::ExperimentalOptions;
 use super::generated_code_options::GeneratedCodeOptions;
 use super::legal_comments::LegalComments;
@@ -32,7 +33,8 @@ use crate::inner_bundler_options::types::optimization::NormalizedOptimizationCon
 use crate::{
   DeferSyncScanDataOption, EmittedAsset, EsModuleFlag, FilenameTemplate, GlobalsOutputOption,
   HashCharacters, InjectImport, InputItem, InvalidateJsSideCache, LogLevel,
-  MakeAbsoluteExternalsRelative, ModuleType, OnLog, RollupPreRenderedAsset, TransformOptions,
+  MakeAbsoluteExternalsRelative, ModuleType, OnLog, RollupPreRenderedAsset, StrictMode,
+  TransformOptions,
 };
 
 #[expect(clippy::struct_excessive_bools)] // Using raw booleans is more clear in this case
@@ -50,8 +52,6 @@ pub struct NormalizedBundlerOptions {
   pub module_types: FxHashMap<Cow<'static, str>, ModuleType>,
   // --- Output
   pub name: Option<String>,
-  pub css_entry_filenames: ChunkFilenamesOutputOption,
-  pub css_chunk_filenames: ChunkFilenamesOutputOption,
   pub entry_filenames: ChunkFilenamesOutputOption,
   pub chunk_filenames: ChunkFilenamesOutputOption,
   pub asset_filenames: AssetFilenamesOutputOption,
@@ -78,6 +78,7 @@ pub struct NormalizedBundlerOptions {
   pub sourcemap_ignore_list: Option<SourceMapIgnoreList>,
   pub sourcemap_path_transform: Option<SourceMapPathTransform>,
   pub sourcemap_debug_ids: bool,
+  pub sourcemap_exclude_sources: bool,
   pub sourcemap_base_url: Option<String>,
   pub experimental: ExperimentalOptions,
   pub minify: MinifyOptions,
@@ -94,6 +95,7 @@ pub struct NormalizedBundlerOptions {
   pub profiler_names: bool,
   pub watch: WatchOption,
   pub legal_comments: LegalComments,
+  pub comments: CommentsOptions,
   pub drop_labels: FxHashSet<String>,
   pub polyfill_require: bool,
   pub defer_sync_scan_data: Option<DeferSyncScanDataOption>,
@@ -113,6 +115,7 @@ pub struct NormalizedBundlerOptions {
   pub clean_dir: bool,
   pub context: String,
   pub strict_execution_order: bool,
+  pub strict: StrictMode,
 }
 
 // This is only used for testing
@@ -128,8 +131,6 @@ impl Default for NormalizedBundlerOptions {
       shim_missing_exports: Default::default(),
       module_types: Default::default(),
       name: Default::default(),
-      css_entry_filenames: ChunkFilenamesOutputOption::String(String::new()),
-      css_chunk_filenames: ChunkFilenamesOutputOption::String(String::new()),
       entry_filenames: ChunkFilenamesOutputOption::String(String::new()),
       chunk_filenames: ChunkFilenamesOutputOption::String(String::new()),
       asset_filenames: AssetFilenamesOutputOption::String(String::new()),
@@ -154,6 +155,7 @@ impl Default for NormalizedBundlerOptions {
       sourcemap_ignore_list: Default::default(),
       sourcemap_path_transform: Default::default(),
       sourcemap_debug_ids: Default::default(),
+      sourcemap_exclude_sources: false,
       sourcemap_base_url: Default::default(),
       experimental: Default::default(),
       minify: MinifyOptions::Disabled,
@@ -170,6 +172,7 @@ impl Default for NormalizedBundlerOptions {
       profiler_names: Default::default(),
       watch: Default::default(),
       legal_comments: LegalComments::None,
+      comments: CommentsOptions::default(),
       drop_labels: Default::default(),
       polyfill_require: Default::default(),
       defer_sync_scan_data: Default::default(),
@@ -189,6 +192,7 @@ impl Default for NormalizedBundlerOptions {
       clean_dir: false,
       context: Default::default(),
       strict_execution_order: false,
+      strict: StrictMode::default(),
     }
   }
 }

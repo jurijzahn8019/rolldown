@@ -1,10 +1,7 @@
 import type { Program } from '@oxc-project/types';
 import type { InputOptions, OutputOptions } from '..';
-import type {
-  BindingHookResolveIdExtraArgs,
-  BindingMagicString,
-  BindingTransformHookExtraArgs,
-} from '../binding.cjs';
+import type { BindingHookResolveIdExtraArgs, BindingTransformHookExtraArgs } from '../binding.cjs';
+import type { RolldownMagicString } from '../binding-magic-string';
 import type { BuiltinPlugin } from '../builtin-plugin/utils';
 import type { DefinedHookNames } from '../constants/plugin';
 import type { DEFINED_HOOK_NAMES } from '../constants/plugin';
@@ -30,6 +27,8 @@ import type { TreeshakingOptions } from '../types/module-side-effects';
 import type { WatcherOptions } from '../options/input-options';
 // oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
 import type { RolldownBuild } from '../api/rolldown/rolldown-build';
+// oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
+import type { BundleError } from '../utils/error';
 
 type ModuleSideEffects = boolean | 'no-treeshake' | null;
 export { withFilter } from './with-filter';
@@ -87,8 +86,8 @@ interface SpecifiedModuleOptions {
    * 1. {@linkcode Plugin.transform | transform} hook's returned `moduleSideEffects` option
    * 2. {@linkcode Plugin.load | load} hook's returned `moduleSideEffects` option
    * 3. {@linkcode Plugin.resolveId | resolveId} hook's returned `moduleSideEffects` option
-   * 4. `sideEffects` field in the `package.json` file
-   * 5. {@linkcode TreeshakingOptions.moduleSideEffects | treeshake.moduleSideEffects} option
+   * 4. {@linkcode TreeshakingOptions.moduleSideEffects | treeshake.moduleSideEffects} option
+   * 5. `sideEffects` field in the `package.json` file
    * 6. `true` (default)
    */
   moduleSideEffects?: ModuleSideEffects | null;
@@ -131,6 +130,11 @@ export interface SourceDescription
 
 /** @inline */
 export interface ResolveIdExtraOptions {
+  /**
+   * Plugin-specific options.
+   *
+   * See [Custom resolver options section](https://rolldown.rs/apis/plugin-api/inter-plugin-communication#custom-resolver-options) for more details.
+   */
   custom?: CustomPluginOptions;
   /**
    * Whether this is resolution for an entry point.
@@ -138,6 +142,17 @@ export interface ResolveIdExtraOptions {
    * {@include ./docs/plugin-hooks-resolveid-isentry.md}
    */
   isEntry: boolean;
+  /**
+   * The kind of import being resolved.
+   *
+   * - `import-statement`: `import { foo } from './lib.js';`
+   * - `dynamic-import`: `import('./lib.js')`
+   * - `require-call`: `require('./lib.js')`
+   * - `import-rule`: `@import 'bg-color.css'` (experimental)
+   * - `url-token`: `url('./icon.png')` (experimental)
+   * - `new-url`: `new URL('./worker.js', import.meta.url)` (experimental)
+   * - `hot-accept`: `import.meta.hot.accept('./lib.js', () => {})` (experimental)
+   */
   kind: BindingHookResolveIdExtraArgs['kind'];
 }
 
@@ -151,7 +166,7 @@ export type LoadResult = NullValue | string | SourceDescription;
 export type TransformResult =
   | NullValue
   | string
-  | (Omit<SourceDescription, 'code'> & { code?: string | BindingMagicString });
+  | (Omit<SourceDescription, 'code'> & { code?: string | RolldownMagicString });
 
 export type RenderedChunkMeta = {
   /**
@@ -164,7 +179,7 @@ export type RenderedChunkMeta = {
    * Use this to perform string transformations with automatic source map support.
    * This is only available when `experimental.nativeMagicString` is enabled.
    */
-  magicString?: BindingMagicString;
+  magicString?: RolldownMagicString;
 };
 
 /** @category Plugin APIs */
@@ -288,7 +303,19 @@ export interface FunctionPluginHooks {
    */
   [DEFINED_HOOK_NAMES.resolveDynamicImport]: (
     this: PluginContext,
+    /**
+     * The importee exactly as it is written in the import statement.
+     *
+     * For example, given `import('./foo.js')`, the `source` will be `"./foo.js"`.
+     *
+     * In Rollup, this parameter can also be an AST node. But Rolldown always provides a string.
+     */
     source: string,
+    /**
+     * The fully resolved id of the importing module.
+     *
+     * This will be `undefined` when {@linkcode PluginContext.resolve | this.resolve(source, undefined, { kind: 'dynamic-import' })} is called.
+     */
     importer: string | undefined,
   ) => ResolveIdResult;
 
@@ -310,6 +337,8 @@ export interface FunctionPluginHooks {
    *
    * You can use {@linkcode PluginContext.getModuleInfo | this.getModuleInfo()} to find out the previous values of `meta`, `moduleSideEffects` inside this hook.
    *
+   * {@include ./docs/plugin-hooks-transform.md}
+   *
    * @group Build Hooks
    */
   [DEFINED_HOOK_NAMES.transform]: (
@@ -318,7 +347,7 @@ export interface FunctionPluginHooks {
     id: string,
     meta: BindingTransformHookExtraArgs & {
       moduleType: ModuleType;
-      magicString?: BindingMagicString;
+      magicString?: RolldownMagicString;
       ast?: Program;
     },
   ) => TransformResult;
@@ -345,7 +374,7 @@ export interface FunctionPluginHooks {
    */
   [DEFINED_HOOK_NAMES.buildEnd]: (
     this: PluginContext,
-    /** The error occurred during the build if applicable. */
+    /** The error occurred during the build if applicable. Normally {@linkcode BundleError} */
     err?: Error,
   ) => void;
 
@@ -393,9 +422,9 @@ export interface FunctionPluginHooks {
   ) =>
     | NullValue
     | string
-    | BindingMagicString
+    | RolldownMagicString
     | {
-        code: string | BindingMagicString;
+        code: string | RolldownMagicString;
         map?: SourceMapInput;
       };
 
@@ -424,7 +453,11 @@ export interface FunctionPluginHooks {
    *
    * @group Output Generation Hooks
    */
-  [DEFINED_HOOK_NAMES.renderError]: (this: PluginContext, error: Error) => void;
+  [DEFINED_HOOK_NAMES.renderError]: (
+    this: PluginContext,
+    /** The error that occurred during the build. Normally {@linkcode BundleError} */
+    error: Error,
+  ) => void;
 
   /**
    * Called at the end of {@linkcode RolldownBuild.generate | bundle.generate()} or

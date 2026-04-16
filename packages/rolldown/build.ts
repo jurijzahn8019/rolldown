@@ -59,7 +59,7 @@ const bindingFileWasiBrowser = nodePath.resolve('src/rolldown-binding.wasi-brows
 
 const configs: BuildOptions[] = [
   withShared({
-    plugins: [patchBindingJs(), dts()],
+    plugins: [patchBindingJs(), dts(), removeIncludeTagsFromDts()],
     output: {
       dir: buildMeta.buildOutputDir,
       format: 'esm',
@@ -107,10 +107,10 @@ function withShared({
     input: {
       index: './src/index',
       'plugins-index': './src/plugins-index',
+      'utils-index': './src/utils-index',
       'experimental-index': './src/experimental-index',
       ...(!isBrowserBuild
         ? {
-            'cli-setup': './src/cli/setup-index',
             cli: './src/cli/index',
             config: './src/config',
             'parallel-plugin': './src/parallel-plugin',
@@ -147,10 +147,6 @@ function withShared({
     },
     transform: {
       target: 'node22',
-      decorator: {
-        // Legacy decorators are required for the @lazyProp decorator
-        legacy: true,
-      },
       define: {
         'import.meta.browserBuild': String(isBrowserBuild),
       },
@@ -159,7 +155,7 @@ function withShared({
 }
 
 // alias binding file to rolldown-binding.wasi.js and mark it as external
-// alias its dts file to rolldown-binding.d.ts without external
+// skip redirection for .d.ts importers so the dts plugin can bundle types
 function resolveWasiBinding(isBrowserBuild?: boolean): Plugin {
   return {
     name: 'resolve-wasi-binding',
@@ -169,6 +165,8 @@ function resolveWasiBinding(isBrowserBuild?: boolean): Plugin {
         const resolution = await this.resolve(id, importer, options);
 
         if (resolution?.id === bindingFile) {
+          // Let .d.ts importers resolve normally so binding types get bundled inline
+          if (importer && /\.d\.[cm]?ts$/.test(importer)) return resolution;
           const id = isBrowserBuild ? bindingFileWasiBrowser : bindingFileWasi;
           return { id, external: 'relative' };
         }
@@ -278,4 +276,33 @@ function getTsconfigCompilerOptionsForFile(file: string) {
     compilerOptions = parsedConfig.options;
   }
   return compilerOptions;
+}
+
+/**
+ * Removes {@include ...} tags from generated .d.ts files.
+ * These tags are only used for the docs site and should not appear in the published types.
+ */
+function removeIncludeTagsFromDts(): Plugin {
+  const includeTagRegex = /\s*\{@include\s+[^}]+\}/g;
+
+  return {
+    name: 'remove-include-tags-from-dts',
+    generateBundle(_options, bundle) {
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (!fileName.endsWith('.d.ts') && !fileName.endsWith('.d.mts')) {
+          continue;
+        }
+        if (output.type === 'asset') {
+          this.warn(
+            `Expected .d.ts files to be chunks, but found asset type for ${fileName} (type: ${output.type}).`,
+          );
+        } else if (output.type === 'chunk') {
+          const matches = output.code.match(includeTagRegex);
+          if (matches) {
+            output.code = output.code.replace(includeTagRegex, '');
+          }
+        }
+      }
+    },
+  };
 }

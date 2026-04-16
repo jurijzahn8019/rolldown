@@ -1,6 +1,6 @@
 {
   "name": "rolldown",
-  "version": "1.0.0-beta.60",
+  "version": "1.0.0-rc.16",
   "description": "Fast JavaScript/TypeScript bundler in Rust with Rollup-compatible API.",
   "keywords": [
     "bundler",
@@ -69,6 +69,10 @@
     "./plugins": {
       "dev": "./src/plugins-index.ts",
       "default": "./dist/plugins-index.mjs"
+    },
+    "./utils": {
+      "dev": "./src/utils-index.ts",
+      "default": "./dist/utils-index.mjs"
     }
   },
   "publishConfig": {
@@ -85,7 +89,8 @@
       "./parallelPlugin": "./dist/parallel-plugin.mjs",
       "./parseAst": "./dist/parse-ast-index.mjs",
       "./package.json": "./package.json",
-      "./plugins": "./dist/plugins-index.mjs"
+      "./plugins": "./dist/plugins-index.mjs",
+      "./utils": "./dist/utils-index.mjs"
     },
     "registry": "https://registry.npmjs.org/"
   },
@@ -98,7 +103,7 @@
     "build-binding:wasi": "pnpm build-binding --target wasm32-wasip1-threads",
     "build-binding:wasi:release": "pnpm build-binding --profile release-wasi --target wasm32-wasip1-threads",
     "# Scrips for node #": "_",
-    "build-node": "oxnode -C dev ./build.ts",
+    "build-node": "node --enable-source-maps --import @oxc-node/core/register -C dev ./build.ts",
     "build-types-check": "tsc -p ./tsconfig.check.json",
     "build-js-glue": "pnpm run --sequential '/^build-(node|types-check)$/'",
     "build-native:debug": "pnpm run --sequential '/^build-(binding|js-glue)$/'",
@@ -107,8 +112,8 @@
     "build-native:memory-profile": "pnpm run build-binding:profile --features default_global_allocator && pnpm run build-js-glue",
     "build-wasi:debug": "TARGET='rolldown-wasi' pnpm run --sequential '/^build-(binding|binding:wasi|node)$/'",
     "build-wasi:release": "TARGET='rolldown-wasi' pnpm run --sequential '/^build-(binding|binding:wasi:release|node)$/'",
-    "build-browser-pkg:debug": "TARGET='browser' pnpm run --sequential '/^build-(binding|binding:wasi|node)$/'",
-    "build-browser-pkg:release": "TARGET='browser' pnpm run --sequential '/^build-(binding|binding:wasi:release|node)$/'",
+    "build-browser-pkg:debug": "TARGET='browser' pnpm run --sequential '/^build-(binding:wasi|node)$/'",
+    "build-browser-pkg:release": "TARGET='browser' pnpm run --sequential '/^build-(binding:wasi:release|node)$/'",
     "# Scrips for docs #": "_",
     "prepublishOnly": "napi pre-publish -t npm --no-gh-release",
     "publint": "publint ."
@@ -123,6 +128,7 @@
     "@oxc-node/cli": "catalog:",
     "@rollup/plugin-json": "catalog:",
     "buble": "catalog:",
+    "cac": "catalog:",
     "consola": "catalog:",
     "execa": "catalog:",
     "glob": "catalog:",
@@ -139,7 +145,7 @@
   },
   "napi": {
     "binaryName": "rolldown-binding",
-    "dtsHeader": "type MaybePromise<T> = T | Promise<T>\ntype Nullable<T> = T | null | undefined\ntype VoidNullable<T = void> = T | null | undefined | void\nexport type BindingStringOrRegex = string | RegExp\ntype BindingResult<T> = { errors: BindingError[], isBindingErrors: boolean } | T\n\n",
+    "dtsHeader": "type MaybePromise<T> = T | Promise<T>\ntype Nullable<T> = T | null | undefined\ntype VoidNullable<T = void> = T | null | undefined | void\nexport type BindingStringOrRegex = string | RegExp\nexport type BindingResult<T> = { errors: BindingError[], isBindingErrors: boolean } | T\n\n",
     "packageName": "@rolldown/binding",
     "targets": [
       "x86_64-apple-darwin",
@@ -154,13 +160,16 @@
       "aarch64-unknown-linux-ohos",
       "aarch64-pc-windows-msvc",
       "aarch64-linux-android",
-      "wasm32-wasip1-threads"
+      "wasm32-wasip1-threads",
+      "s390x-unknown-linux-gnu",
+      "powerpc64le-unknown-linux-gnu"
     ],
     "wasm": {
       "initialMemory": 16384,
       "browser": {
         "fs": true,
-        "asyncInit": true
+        "asyncInit": true,
+        "errorEvent": true
       }
     }
   },

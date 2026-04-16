@@ -13,7 +13,7 @@ import {
 } from '../log/logging';
 import { error, logPluginError } from '../log/logs';
 import type { Extends, TypeAssert } from '../types/assert';
-import { VERSION } from '../version';
+import { VERSION } from '../constants';
 // oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
 import type { RolldownLog } from '../log/logging';
 // oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
@@ -44,8 +44,6 @@ export interface PluginContextMeta {
 
 /** @category Plugin APIs */
 export interface MinimalPluginContext {
-  /** @hidden */
-  readonly pluginName: string;
   /**
    * Similar to {@linkcode warn | this.warn}, except that it will also abort
    * the bundling process with an error.

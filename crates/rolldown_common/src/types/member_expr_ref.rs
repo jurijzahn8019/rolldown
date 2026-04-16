@@ -1,9 +1,16 @@
-use oxc::{
-  semantic::ReferenceId,
-  span::{CompactStr, Span},
-};
+use oxc::{semantic::ReferenceId, span::Span};
+use oxc_str::CompactStr;
 
 use crate::{MemberExprRefResolution, SymbolRef, type_aliases::MemberExprRefResolutionMap};
+
+/// A single property access in a member expression chain.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MemberExprProp {
+  pub name: CompactStr,
+  pub span: Span,
+  /// Whether this property access uses optional chaining (`?.`).
+  pub optional: bool,
+}
 
 /// For member expression, e.g. `foo_ns.bar_ns.c`
 /// - `object_ref` is the `SymbolRef` that represents `foo_ns`
@@ -11,7 +18,7 @@ use crate::{MemberExprRefResolution, SymbolRef, type_aliases::MemberExprRefResol
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemberExprRef {
   pub object_ref: SymbolRef,
-  pub prop_and_span_list: Vec<(CompactStr, Span)>,
+  pub prop_and_span_list: Vec<MemberExprProp>,
   /// Span of the whole member expression
   /// FIXME: use `AstNodeId` to identify the MemberExpr instead of `Span`
   /// related discussion: https://github.com/rolldown/rolldown/pull/1818#discussion_r1699374441
@@ -21,6 +28,8 @@ pub struct MemberExprRef {
   /// Used during symbol renaming to find the scope where the reference occurs,
   /// enabling detection of potential shadowing by nested scope bindings.
   pub reference_id: Option<ReferenceId>,
+  /// Whether this member expression is in a write context (assignment target).
+  pub is_write: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,12 +42,20 @@ pub enum MemberExprObjectReferencedType {
 impl MemberExprRef {
   pub fn new(
     object_ref: SymbolRef,
-    prop_and_span_list: Vec<(CompactStr, Span)>,
+    prop_and_span_list: Vec<MemberExprProp>,
     span: Span,
     obj_ref_type: MemberExprObjectReferencedType,
     reference_id: Option<ReferenceId>,
+    is_write: bool,
   ) -> Self {
-    Self { object_ref, prop_and_span_list, span, object_ref_type: obj_ref_type, reference_id }
+    Self {
+      object_ref,
+      prop_and_span_list,
+      span,
+      object_ref_type: obj_ref_type,
+      reference_id,
+      is_write,
+    }
   }
 
   /// This method is tricky, use it with care.

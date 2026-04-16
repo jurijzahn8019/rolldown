@@ -18,36 +18,44 @@ test(`emit data for devtool`, async () => {
 
   const dotRolldownDir = readdirSync(dotRolldownFileName);
   expect(dotRolldownDir.length).toBe(1);
-  const debugDataDir = readdirSync(
-    join(dotRolldownFileName, dotRolldownDir[0]),
-  );
+  const debugDataDir = readdirSync(join(dotRolldownFileName, dotRolldownDir[0]));
   // Expect `logs.json` and `meta.json` exist
   expect(debugDataDir).toContain('logs.json');
   expect(debugDataDir).toContain('meta.json');
 
   // Ensure there are no invalid uninjected variables in the logs
-  const variables = [
-    '${build_id}',
-    '${session_id}',
-    '${hook_resolve_id_trigger}',
-  ];
-  const logsContent = readFileSync(
-    join(
-      dotRolldownFileName,
-      dotRolldownDir[0],
-      'logs.json',
-    ),
-  );
+  const variables = ['${build_id}', '${session_id}', '${hook_resolve_id_trigger}'];
+  const logsContent = readFileSync(join(dotRolldownFileName, dotRolldownDir[0], 'logs.json'));
   for (const variable of variables) {
     expect(logsContent.includes(variable)).toBe(false);
   }
-  const metaContent = readFileSync(
-    join(
-      dotRolldownFileName,
-      dotRolldownDir[0],
-      'meta.json',
-    ),
+
+  const logs = logsContent
+    .toString()
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+
+  const moduleGraphReady = logs.find((event) => event.action === 'ModuleGraphReady');
+  expect(moduleGraphReady).toBeDefined();
+  const entryModule = moduleGraphReady.modules.find((module) => /[\\/]index\.ts$/.test(module.id));
+  expect(entryModule).toBeDefined();
+  expect(entryModule.imports).toContainEqual(
+    expect.objectContaining({
+      kind: 'dynamic-import',
+      module_request: './async',
+    }),
   );
+
+  const chunkGraphReady = logs.find((event) => event.action === 'ChunkGraphReady');
+  expect(chunkGraphReady).toBeDefined();
+  expect(
+    chunkGraphReady.chunks.some((chunk) =>
+      chunk.imports.some((item) => item.kind === 'dynamic-import'),
+    ),
+  ).toBe(true);
+
+  const metaContent = readFileSync(join(dotRolldownFileName, dotRolldownDir[0], 'meta.json'));
   for (const variable of variables) {
     expect(metaContent.includes(variable)).toBe(false);
   }
@@ -75,9 +83,7 @@ test(`emit data for devtool`, async () => {
           async resolveId(source, importer) {
             // Test this.resolve functionality
             if (source === './hello' && importer) {
-              console.log(
-                `[test-resolve] Resolving "${source}" from "${importer}"`,
-              );
+              console.log(`[test-resolve] Resolving "${source}" from "${importer}"`);
 
               // Use this.resolve to resolve the module
               const resolved = await this.resolve('./hello.ts', importer, {
@@ -85,9 +91,7 @@ test(`emit data for devtool`, async () => {
               });
 
               if (resolved) {
-                console.log(
-                  `[test-resolve] Successfully resolved to: ${resolved.id}`,
-                );
+                console.log(`[test-resolve] Successfully resolved to: ${resolved.id}`);
                 return resolved;
               } else {
                 console.log(`[test-resolve] Failed to resolve "${source}"`);

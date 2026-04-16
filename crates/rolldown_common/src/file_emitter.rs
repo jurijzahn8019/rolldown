@@ -1,11 +1,12 @@
 use crate::{
-  AddEntryModuleMsg, FilenameTemplate, ModuleLoaderMsg, Modules, NormalizedBundlerOptions, Output,
-  OutputAsset, OutputChunk, PreserveEntrySignatures, StrOrBytes,
+  AddEntryModuleMsg, FilenameTemplate, ModuleId, ModuleLoaderMsg, Modules,
+  NormalizedBundlerOptions, Output, OutputAsset, OutputChunk, PreserveEntrySignatures, StrOrBytes,
+  is_path_fragment,
 };
 use anyhow::Context;
 use arcstr::ArcStr;
 use dashmap::{DashMap, DashSet, Entry};
-use rolldown_error::BuildDiagnostic;
+use rolldown_error::{BuildDiagnostic, InvalidOptionType};
 use rolldown_utils::dashmap::{FxDashMap, FxDashSet};
 use rolldown_utils::make_unique_name::make_unique_name;
 use rolldown_utils::xxhash::{xxhash_base64_url, xxhash_with_base};
@@ -13,6 +14,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use sugar_path::SugarPath;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Default)]
@@ -26,6 +28,18 @@ pub struct EmittedAsset {
 impl EmittedAsset {
   pub fn name_for_sanitize(&self) -> &str {
     self.name.as_deref().unwrap_or("asset")
+  }
+
+  /// Returns true if the emitted asset has a valid name (not an absolute or relative path).
+  /// Similar to Rollup's `hasValidName` function.
+  pub fn has_valid_name(&self) -> bool {
+    let validated_name = self.file_name.as_deref().or(self.name.as_deref());
+    validated_name.is_none_or(|name| !is_path_fragment(name))
+  }
+
+  /// Returns the validated name (fileName or name) if present.
+  pub fn validated_name(&self) -> Option<&str> {
+    self.file_name.as_deref().or(self.name.as_deref())
   }
 }
 
@@ -47,10 +61,14 @@ pub struct EmittedChunkInfo {
 #[derive(Debug, Clone)]
 pub struct EmittedPrebuiltChunk {
   pub file_name: ArcStr,
+  pub name: Option<ArcStr>,
   pub code: String,
   pub exports: Vec<String>,
   pub map: Option<rolldown_sourcemap::SourceMap>,
   pub sourcemap_filename: Option<String>,
+  pub facade_module_id: Option<ArcStr>,
+  pub is_entry: bool,
+  pub is_dynamic_entry: bool,
 }
 
 #[derive(Debug)]
@@ -67,6 +85,10 @@ pub struct FileEmitter {
   emitted_files: FxDashSet<ArcStr>,
   emitted_chunks: FxDashMap<ArcStr, ArcStr>,
   emitted_filenames: FxDashSet<ArcStr>,
+  /// Maps module IDs to their emitted file reference IDs.
+  /// Used by the asset module plugin to associate modules with emitted files
+  /// so that the `new URL()` finalizer can look up asset filenames.
+  module_to_file_ref: FxDashMap<ArcStr, ArcStr>,
 }
 
 impl FileEmitter {
@@ -83,6 +105,7 @@ impl FileEmitter {
       options,
       emitted_files: DashSet::default(),
       emitted_filenames: FxDashSet::default(),
+      module_to_file_ref: DashMap::default(),
     }
   }
 
@@ -121,6 +144,15 @@ impl FileEmitter {
     asset_filename_template: Option<FilenameTemplate>,
     sanitized_file_name: Option<ArcStr>,
   ) -> anyhow::Result<ArcStr> {
+    if !file.has_valid_name() {
+      return Err(
+        BuildDiagnostic::invalid_option(InvalidOptionType::InvalidEmittedFileName(
+          file.validated_name().unwrap_or_default().to_string(),
+        ))
+        .into(),
+      );
+    }
+
     let hash: ArcStr =
       xxhash_with_base(file.source.as_bytes(), self.options.hash_characters.base()).into();
 
@@ -212,14 +244,25 @@ impl FileEmitter {
     if file.file_name.is_none() {
       let sanitized_file_name = sanitized_file_name.expect("should has sanitized file name");
       let path = Path::new(sanitized_file_name.as_str());
-      let name = path.file_stem().and_then(OsStr::to_str);
+      // Extract extension from the filename only
       let extension = path.extension().and_then(OsStr::to_str);
+      // Extract name including directory path, but without extension
+      // e.g., "foo/bar.txt" -> "foo/bar", "bar.txt" -> "bar"
+      // Security: normalize path and filter out dangerous components
+      let name = path.file_stem().and_then(OsStr::to_str).map(|stem| {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+          // Normalize to resolve ".." and "." where possible, then convert to forward slashes
+          parent.join(stem).normalize().to_slash_lossy().into_owned()
+        } else {
+          stem.to_string()
+        }
+      });
       let filename_template =
         filename_template.expect("should has filename template without filename");
 
       let mut filename = filename_template
         .render(
-          name,
+          name.as_deref(),
           None,
           Some(extension.unwrap_or_default()),
           Some(|len: Option<usize>| Ok(&hash[..len.map_or(8, |len| len.clamp(1, 21))])),
@@ -240,6 +283,7 @@ impl FileEmitter {
     bundle: &mut Vec<Output>,
     warnings: &mut Vec<BuildDiagnostic>,
   ) {
+    let mut additional_assets = Vec::new();
     self.files.iter_mut().for_each(|mut file| {
       let (key, value) = file.pair_mut();
       if self.emitted_files.contains(key) {
@@ -259,13 +303,16 @@ impl FileEmitter {
 
       let mut original_file_names = std::mem::take(&mut value.original_file_names);
       original_file_names.sort_unstable();
-      bundle.push(Output::Asset(Arc::new(OutputAsset {
+      additional_assets.push(Output::Asset(Arc::new(OutputAsset {
         filename: value.filename.clone(),
         names,
         original_file_names,
         source: std::mem::take(&mut value.source),
       })));
     });
+    // Sort to ensure deterministic output order regardless of DashMap iteration order
+    additional_assets.sort_unstable_by(|a, b| a.filename().cmp(b.filename()));
+    bundle.extend(additional_assets);
 
     // Add prebuilt chunks to the bundle
     self.prebuilt_chunks.iter().for_each(|prebuilt_chunk| {
@@ -284,10 +331,10 @@ impl FileEmitter {
       }
 
       bundle.push(Output::Chunk(Arc::new(OutputChunk {
-        name: value.file_name.clone(),
-        is_entry: false,
-        is_dynamic_entry: false,
-        facade_module_id: None,
+        name: value.name.clone().unwrap_or_else(|| value.file_name.clone()),
+        is_entry: value.is_entry,
+        is_dynamic_entry: value.is_dynamic_entry,
+        facade_module_id: value.facade_module_id.clone().map(ModuleId::from),
         module_ids: vec![],
         exports: value.exports.iter().map(|s| s.as_str().into()).collect(),
         filename: value.file_name.clone(),
@@ -310,6 +357,17 @@ impl FileEmitter {
     *tx_guard = tx;
   }
 
+  /// Associate a module ID with an emitted file reference ID.
+  /// This allows the `new URL()` finalizer to look up asset filenames by module ID.
+  pub fn associate_module_with_file_ref(&self, module_id: &str, reference_id: &str) {
+    self.module_to_file_ref.insert(ArcStr::from(module_id), ArcStr::from(reference_id));
+  }
+
+  /// Get the emitted file reference ID for a given module ID.
+  pub fn file_ref_for_module(&self, module_id: &str) -> Option<ArcStr> {
+    self.module_to_file_ref.get(module_id).map(|v| v.value().clone())
+  }
+
   pub fn clear(&self) {
     self.chunks.clear();
     self.files.clear();
@@ -319,6 +377,8 @@ impl FileEmitter {
     self.base_reference_id.store(0, Ordering::Relaxed);
     self.emitted_files.clear();
     self.emitted_chunks.clear();
+    self.emitted_filenames.clear();
+    self.module_to_file_ref.clear();
   }
 }
 

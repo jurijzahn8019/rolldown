@@ -70,7 +70,8 @@ impl Plugin for ViteHtmlPlugin {
     Ok(())
   }
 
-  #[expect(clippy::too_many_lines)]
+  // html5gum::Span uses usize for start/end, but we know HTML files are < 4GB
+  #[expect(clippy::too_many_lines, clippy::cast_possible_truncation)]
   async fn transform(
     &self,
     ctx: rolldown_plugin::SharedTransformPluginContext,
@@ -148,7 +149,7 @@ impl Plugin for ViteHtmlPlugin {
                 }
                 "vite-ignore" => {
                   is_ignored = true;
-                  s.remove(attr.span.start, attr.span.end)
+                  s.remove(attr.span.start as u32, attr.span.end as u32)
                     .expect("remove should not fail in html plugin");
                 }
                 _ => {}
@@ -261,7 +262,7 @@ impl Plugin for ViteHtmlPlugin {
           ) {
             let attrs_borrowed = attrs.borrow();
             if let Some(attr) = attrs_borrowed.iter().find(|a| &*a.name == "vite-ignore") {
-              s.remove(attr.span.start, attr.span.end)
+              s.remove(attr.span.start as u32, attr.span.end as u32)
                 .expect("remove should not fail in html plugin");
             } else {
               // Collect all attributes into a map for filtering
@@ -359,7 +360,7 @@ impl Plugin for ViteHtmlPlugin {
           }
 
           if should_remove {
-            s.remove(elem_span.start, elem_span.end)
+            s.remove(elem_span.start as u32, elem_span.end as u32)
               .expect("remove should not fail in html plugin");
           }
         }
@@ -419,7 +420,7 @@ impl Plugin for ViteHtmlPlugin {
       } else {
         continue;
       };
-      s.update(range.start, range.end, partial_encode_url_path(&url).into_owned())
+      s.update(range.start as u32, range.end as u32, partial_encode_url_path(&url).into_owned())
         .expect("update should not fail in html plugin");
     }
 
@@ -434,7 +435,8 @@ impl Plugin for ViteHtmlPlugin {
     for (url, span, resolved) in resolved_style_urls {
       match resolved?.ok() {
         Some(_) => {
-          s.remove(span.start, span.end).expect("remove should not fail in html plugin");
+          s.remove(span.start as u32, span.end as u32)
+            .expect("remove should not fail in html plugin");
         }
         None => {
           ctx.warn(LogWithoutPlugin {
@@ -503,9 +505,12 @@ impl Plugin for ViteHtmlPlugin {
   ) -> rolldown_plugin::HookNoopReturn {
     let mut inline_entry_chunk = FxHashSet::default();
     let mut analyzed_imported_css_files = FxHashMap::default();
-    for item in &self.html_result_map {
-      let ((id, assets_base), (html, is_async)) = item.pair();
-
+    let html_result_map = self
+      .html_result_map
+      .iter()
+      .map(|item| (item.key().clone(), item.value().clone()))
+      .collect::<Vec<_>>();
+    for ((id, assets_base), (html, is_async)) in html_result_map {
       let mut result = html.clone();
 
       let path = id.relative(&self.root);
@@ -519,7 +524,7 @@ impl Plugin for ViteHtmlPlugin {
           && chunk
             .facade_module_id
             .as_ref()
-            .is_some_and(|facade_module_id| facade_module_id.as_arc_str() == id))
+            .is_some_and(|facade_module_id| facade_module_id.as_arc_str() == &id))
         .then_some(chunk),
         rolldown_common::Output::Asset(_) => None,
       });
@@ -545,7 +550,7 @@ impl Plugin for ViteHtmlPlugin {
               utils::ImportedChunk::External(external) => external.to_string(),
               utils::ImportedChunk::Chunk(chunk) => {
                 self
-                  .to_output_file_path(&chunk.filename, assets_base, false, &relative_url_path)
+                  .to_output_file_path(&chunk.filename, &assets_base, false, &relative_url_path)
                   .await?
               }
             };
@@ -554,7 +559,7 @@ impl Plugin for ViteHtmlPlugin {
               ("crossorigin", AttrValue::Boolean(true)),
               ("src", AttrValue::String(url)),
             ]);
-            if *is_async {
+            if is_async {
               attrs.insert("async", AttrValue::Boolean(true));
             }
             tag.attrs = Some(attrs);
@@ -565,14 +570,14 @@ impl Plugin for ViteHtmlPlugin {
           let mut tags = vec![{
             let mut tag = HtmlTagDescriptor::new("script");
             let url = self
-              .to_output_file_path(&chunk.filename, assets_base, false, &relative_url_path)
+              .to_output_file_path(&chunk.filename, &assets_base, false, &relative_url_path)
               .await?;
             let mut attrs = FxHashMap::from_iter([
               ("type", AttrValue::String("module".to_owned())),
               ("crossorigin", AttrValue::Boolean(true)),
               ("src", AttrValue::String(url)),
             ]);
-            if *is_async {
+            if is_async {
               attrs.insert("async", AttrValue::Boolean(true));
             }
             tag.attrs = Some(attrs);
@@ -593,7 +598,7 @@ impl Plugin for ViteHtmlPlugin {
             for dep in resolved_deps {
               let mut tag = HtmlTagDescriptor::new("link");
               let url =
-                self.to_output_file_path(&dep, assets_base, false, &relative_url_path).await?;
+                self.to_output_file_path(&dep, &assets_base, false, &relative_url_path).await?;
               tag.attrs = Some(FxHashMap::from_iter([
                 ("rel", AttrValue::String("modulepreload".to_owned())),
                 ("crossorigin", AttrValue::Boolean(true)),
@@ -610,7 +615,7 @@ impl Plugin for ViteHtmlPlugin {
         asset_tags.reserve(css_files.len());
         for css_file in css_files {
           let url =
-            self.to_output_file_path(&css_file, assets_base, false, &relative_url_path).await?;
+            self.to_output_file_path(&css_file, &assets_base, false, &relative_url_path).await?;
           let mut tag = HtmlTagDescriptor::new("link");
           tag.attrs = Some(FxHashMap::from_iter([
             ("rel", AttrValue::String("stylesheet".to_owned())),
@@ -634,7 +639,7 @@ impl Plugin for ViteHtmlPlugin {
         });
         if let Some(filename) = filename {
           let url =
-            self.to_output_file_path(filename, assets_base, false, &relative_url_path).await?;
+            self.to_output_file_path(filename, &assets_base, false, &relative_url_path).await?;
           result = utils::inject_to_head(
             &result,
             &[HtmlTagDescriptor {
@@ -659,7 +664,7 @@ impl Plugin for ViteHtmlPlugin {
       result = (self.transform_index_html)(
         &result,
         &format!("/{relative_url_path}"),
-        &normalize_path(id),
+        &normalize_path(&id),
         Some(args.bundle.clone()),
         chunk.map(Arc::clone),
         "generateBundle",
@@ -667,7 +672,7 @@ impl Plugin for ViteHtmlPlugin {
       .await?;
 
       if let Some(s) =
-        self.handle_html_asset_url(ctx, &result, chunk, assets_base, &relative_url_path).await?
+        self.handle_html_asset_url(ctx, &result, chunk, &assets_base, &relative_url_path).await?
       {
         result = s;
       }
@@ -681,7 +686,7 @@ impl Plugin for ViteHtmlPlugin {
       ctx
         .emit_file_async(rolldown_common::EmittedAsset {
           name: None,
-          original_file_name: Some(normalize_path(id).into_owned()),
+          original_file_name: Some(normalize_path(&id).into_owned()),
           file_name: Some(relative_url_path.into()),
           source: rolldown_common::StrOrBytes::Str(result),
         })

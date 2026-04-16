@@ -11,9 +11,7 @@ use super::ScopeHoistingFinalizer;
 impl<'ast> ScopeHoistingFinalizer<'_, 'ast> {
   pub fn generate_hmr_header(&self) -> Vec<ast::Statement<'ast>> {
     let mut ret = vec![];
-    if !self.ctx.options.is_dev_mode_enabled()
-      || self.ctx.module.id.as_ref() == rolldown_plugin_hmr::HMR_RUNTIME_MODULE_SPECIFIER
-    {
+    if !self.ctx.options.is_dev_mode_enabled() {
       return ret;
     }
 
@@ -61,7 +59,7 @@ impl<'ast> ScopeHoistingFinalizer<'_, 'ast> {
         string_literal.value = self
           .snippet
           .builder
-          .atom(self.ctx.modules[import_record.into_resolved_module()].stable_id());
+          .str(self.ctx.modules[import_record.into_resolved_module()].stable_id());
       }
       ast::Argument::ArrayExpression(array_expression) => {
         // `import.meta.hot.accept(['./dep1.js', './dep2.js'], ...)`
@@ -76,7 +74,7 @@ impl<'ast> ScopeHoistingFinalizer<'_, 'ast> {
             string_literal.value = self
               .snippet
               .builder
-              .atom(self.ctx.modules[import_record.into_resolved_module()].stable_id());
+              .str(self.ctx.modules[import_record.into_resolved_module()].stable_id());
           }
         });
       }

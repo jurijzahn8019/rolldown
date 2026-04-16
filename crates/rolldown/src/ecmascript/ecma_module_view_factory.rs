@@ -1,6 +1,7 @@
+use oxc::span::Span;
 use oxc_index::IndexVec;
 use rolldown_common::{
-  EcmaModuleAstUsage, EcmaRelated, EcmaView, EcmaViewMeta, ImportRecordIdx, ModuleType,
+  EcmaModuleAstUsage, EcmaRelated, EcmaView, EcmaViewMeta, FlatOptions, ImportRecordIdx,
   RawImportRecord, ResolvedId, SharedNormalizedBundlerOptions, SideEffectDetail,
   side_effects::{DeterminedSideEffects, HookSideEffects},
 };
@@ -19,6 +20,10 @@ pub struct CreateEcmaViewReturn {
   pub ecma_view: EcmaView,
   pub ecma_related: EcmaRelated,
   pub raw_import_records: IndexVec<ImportRecordIdx, RawImportRecord>,
+  /// The span of the first top-level `await` keyword, if any. Routed through
+  /// the task result into a centralized map on the link stage so it doesn't
+  /// need to live on every `EcmaView`.
+  pub tla_keyword_span: Option<Span>,
 }
 
 pub async fn create_ecma_view(
@@ -26,9 +31,15 @@ pub async fn create_ecma_view(
   args: CreateModuleViewArgs,
 ) -> BuildResult<CreateEcmaViewReturn> {
   let CreateModuleViewArgs { source, sourcemap_chain, hook_side_effects } = args;
-  let ParseToEcmaAstResult { ast, scoping, has_lazy_export, warnings } =
-    parse_to_ecma_ast(ctx, source).await?;
-
+  let ParseToEcmaAstResult {
+    ast,
+    scoping,
+    has_lazy_export,
+    warnings,
+    preserve_jsx,
+    enum_member_value_map,
+  } = parse_to_ecma_ast(ctx, source).await?;
+  ctx.flat_options.set(FlatOptions::JsxPreserve, preserve_jsx);
   ctx.warnings.extend(warnings);
 
   let module_id = ctx.resolved_id.id.clone();
@@ -62,6 +73,7 @@ pub async fn create_ecma_view(
     warnings: scan_warnings,
     errors,
     ast_usage,
+    tla_keyword_span,
     symbol_ref_db: symbols,
     self_referenced_class_decl_symbol_ids,
     hashbang_range,
@@ -75,6 +87,8 @@ pub async fn create_ecma_view(
     dummy_record_set,
     constant_export_map,
     import_attribute_map,
+    cjs_reexport_require_spans: _,
+    cjs_reexport_import_record_ids,
   } = scanner.scan(ast.program())?;
   // If a export symbol in commonjs defined in multiple time, we just bailout treeshake it.
   for (k, v) in commonjs_exports {
@@ -89,14 +103,9 @@ pub async fn create_ecma_view(
 
   ctx.warnings.extend(scan_warnings);
 
-  let side_effects = normalize_side_effects(
-    ctx.options,
-    ctx.resolved_id,
-    Some(&stmt_infos),
-    Some(&ctx.module_type),
-    hook_side_effects,
-  )
-  .await?;
+  let side_effects =
+    normalize_side_effects(ctx.options, ctx.resolved_id, Some(&stmt_infos), hook_side_effects)
+      .await?;
 
   // TODO: Should we check if there are `check_side_effects_for` returns false but there are side effects in the module?
   let ecma_view = EcmaView {
@@ -138,13 +147,15 @@ pub async fn create_ecma_view(
     directive_range,
     dummy_record_set,
     constant_export_map,
+    enum_member_value_map,
     depended_runtime_helper: Box::default(),
     import_attribute_map,
     json_module_none_self_reference_included_symbol: None,
+    cjs_reexport_import_record_ids,
   };
 
-  let ecma_related = EcmaRelated { ast, symbols, dynamic_import_rec_exports_usage };
-  Ok(CreateEcmaViewReturn { ecma_view, ecma_related, raw_import_records })
+  let ecma_related = EcmaRelated { ast, symbols, dynamic_import_rec_exports_usage, preserve_jsx };
+  Ok(CreateEcmaViewReturn { ecma_view, ecma_related, raw_import_records, tla_keyword_span })
 }
 
 /// The side effects priority is:
@@ -157,12 +168,11 @@ pub async fn normalize_side_effects(
   options: &SharedNormalizedBundlerOptions,
   resolved_id: &ResolvedId,
   stmt_infos: Option<&rolldown_common::StmtInfos>,
-  module_type: Option<&ModuleType>,
   hook_side_effects: Option<HookSideEffects>,
 ) -> BuildResult<DeterminedSideEffects> {
   let side_effects = match hook_side_effects {
     Some(side_effects) => match side_effects {
-      HookSideEffects::True => lazy_check_side_effects(resolved_id, module_type, stmt_infos),
+      HookSideEffects::True => lazy_check_side_effects(resolved_id, stmt_infos),
       HookSideEffects::False => DeterminedSideEffects::UserDefined(false),
       HookSideEffects::NoTreeshake => DeterminedSideEffects::NoTreeshake,
     },
@@ -178,7 +188,7 @@ pub async fn normalize_side_effects(
             .await?
           {
             Some(value) => DeterminedSideEffects::UserDefined(value),
-            None => lazy_check_side_effects(resolved_id, module_type, stmt_infos),
+            None => lazy_check_side_effects(resolved_id, stmt_infos),
           }
         } else {
           match opt
@@ -186,7 +196,7 @@ pub async fn normalize_side_effects(
             .native_resolve(&resolved_id.id, resolved_id.external.is_external())
           {
             Some(value) => DeterminedSideEffects::UserDefined(value),
-            None => lazy_check_side_effects(resolved_id, module_type, stmt_infos),
+            None => lazy_check_side_effects(resolved_id, stmt_infos),
           }
         }
       }
@@ -197,7 +207,6 @@ pub async fn normalize_side_effects(
 
 pub fn lazy_check_side_effects(
   resolved_id: &ResolvedId,
-  module_type: Option<&ModuleType>,
   stmt_infos: Option<&rolldown_common::StmtInfos>,
 ) -> DeterminedSideEffects {
   if resolved_id.external.is_external() {
@@ -207,12 +216,7 @@ pub fn lazy_check_side_effects(
       DeterminedSideEffects::NoTreeshake
     };
   }
-  let module_type = module_type.expect("Normal module should have module_type");
   let stmt_infos = stmt_infos.expect("Normal module should have stmt_infos");
-  if matches!(module_type, ModuleType::Css) {
-    // CSS modules are considered to have side effects by default
-    return DeterminedSideEffects::Analyzed(true);
-  }
   resolved_id
     .package_json
     .as_ref()

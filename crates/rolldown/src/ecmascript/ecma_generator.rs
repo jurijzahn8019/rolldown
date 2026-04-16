@@ -8,9 +8,9 @@ use crate::{
 use anyhow::Result;
 use rolldown_common::{
   AddonRenderContext, EcmaAssetMeta, InstantiatedChunk, InstantiationKind, ModuleId, ModuleIdx,
-  OutputFormat, RenderedModule,
+  OutputFormat, RenderedModule, StrictMode,
 };
-use rolldown_error::BuildResult;
+use rolldown_error::{BuildDiagnostic, BuildResult};
 use rolldown_plugin::HookAddonArgs;
 use rolldown_sourcemap::Source;
 #[cfg(not(target_family = "wasm"))]
@@ -18,6 +18,7 @@ use rolldown_utils::rayon::IndexedParallelIterator;
 use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::FxHashMap;
 
+use super::format::utils::is_use_strict_directive;
 use super::format::{cjs::render_cjs, esm::render_esm, iife::render_iife, umd::render_umd};
 
 pub type RenderedModuleSources = Vec<RenderedModuleSource>;
@@ -43,6 +44,7 @@ impl RenderedModuleSource {
 pub struct EcmaGenerator;
 
 impl Generator for EcmaGenerator {
+  #[expect(clippy::too_many_lines)]
   async fn instantiate_chunk(ctx: &mut GenerateContext<'_>) -> Result<BuildResult<GenerateOutput>> {
     let module_id_to_codegen_ret = std::mem::take(&mut ctx.module_id_to_codegen_ret);
     let rendered_module_sources: RenderedModuleSources = ctx
@@ -97,7 +99,7 @@ impl Generator for EcmaGenerator {
       },
     );
 
-    let directives: Vec<_> = ctx
+    let mut directives: Vec<&str> = ctx
       .chunk
       .user_defined_entry_module(&ctx.link_output.module_table)
       .or_else(|| {
@@ -115,6 +117,20 @@ impl Generator for EcmaGenerator {
           .collect::<_>()
       })
       .unwrap_or_default();
+
+    // Apply output.strict option
+    match ctx.options.strict {
+      StrictMode::Always => {
+        let has_use_strict = directives.iter().any(|d| is_use_strict_directive(d));
+        if !has_use_strict {
+          directives.insert(0, "\"use strict\"");
+        }
+      }
+      StrictMode::Never => {
+        directives.retain(|d| !is_use_strict_directive(d));
+      }
+      StrictMode::Auto => {}
+    }
 
     let banner = {
       let injection = match ctx.options.banner.as_ref() {
@@ -172,6 +188,40 @@ impl Generator for EcmaGenerator {
 
     let mut warnings = vec![];
 
+    // Warn when multiple shebang sources would produce duplicate shebangs in the output.
+    // UMD format silently drops the entry hashbang, so it doesn't count as a shebang source.
+    let entry_has_shebang = hashbang.is_some() && !matches!(ctx.options.format, OutputFormat::Umd);
+    let banner_has_shebang = banner.as_ref().is_some_and(|b| b.starts_with("#!"));
+    let post_banner_has_shebang = post_banner.as_ref().is_some_and(|pb| pb.starts_with("#!"));
+
+    if (entry_has_shebang && (banner_has_shebang || post_banner_has_shebang))
+      || (banner_has_shebang && post_banner_has_shebang)
+    {
+      let filename = ctx
+        .chunk
+        .preliminary_filename
+        .as_deref()
+        .expect("chunk file name should be generated before rendering")
+        .to_string();
+      if entry_has_shebang && banner_has_shebang {
+        warnings.push(
+          BuildDiagnostic::duplicate_shebang(filename.clone(), "banner").with_severity_warning(),
+        );
+      }
+      if entry_has_shebang && post_banner_has_shebang {
+        warnings.push(
+          BuildDiagnostic::duplicate_shebang(filename.clone(), "postBanner")
+            .with_severity_warning(),
+        );
+      }
+      if banner_has_shebang && post_banner_has_shebang {
+        warnings.push(
+          BuildDiagnostic::duplicate_shebang(filename, "banner and postBanner")
+            .with_severity_warning(),
+        );
+      }
+    }
+
     let addon_render_context = AddonRenderContext {
       hashbang,
       banner: banner.as_deref(),
@@ -199,8 +249,6 @@ impl Generator for EcmaGenerator {
         }
       }
     };
-
-    ctx.warnings.extend(warnings);
 
     if ctx.options.experimental.is_attach_debug_info_full() && !ctx.chunk.debug_info.is_empty() {
       let debug_info_str =
@@ -250,7 +298,7 @@ impl Generator for EcmaGenerator {
         post_banner,
         post_footer,
       }],
-      warnings: std::mem::take(&mut ctx.warnings),
+      warnings,
     }))
   }
 }

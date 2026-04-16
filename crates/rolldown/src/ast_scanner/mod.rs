@@ -24,20 +24,21 @@ use oxc::{
   },
   ast_visit::Visit,
   semantic::SymbolId,
-  span::{CompactStr, GetSpan, Span},
+  span::{GetSpan, Span},
 };
 use oxc_allocator::Address;
 use oxc_index::IndexVec;
+use oxc_str::CompactStr;
 use rolldown_common::dynamic_import_usage::{DynamicImportExportsUsage, DynamicImportUsageInfo};
 use rolldown_common::{
   ConstExportMeta, ConstantValue, DynamicImportExprInfo, EcmaModuleAstUsage, EcmaViewMeta,
   ExportsKind, FlatOptions, HmrInfo, ImportAttribute, ImportKind, ImportRecordIdx,
-  ImportRecordMeta, LocalExport, MemberExprObjectReferencedType, MemberExprRef, ModuleDefFormat,
-  ModuleId, ModuleIdx, NamedImport, RawImportRecord, SideEffectDetail, Specifier, StmtInfo,
-  StmtInfoIdx, StmtInfoMeta, StmtInfos, SymbolRef, SymbolRefDbForModule, SymbolRefFlags,
+  ImportRecordMeta, LocalExport, MemberExprObjectReferencedType, MemberExprProp, MemberExprRef,
+  ModuleDefFormat, ModuleId, ModuleIdx, NamedImport, RawImportRecord, SideEffectDetail, Specifier,
+  StmtInfo, StmtInfoIdx, StmtInfoMeta, StmtInfos, SymbolRef, SymbolRefDbForModule, SymbolRefFlags,
   TaggedSymbolRef, ThisExprReplaceKind, generate_replace_this_expr_map,
 };
-use rolldown_ecmascript_utils::{BindingIdentifierExt, BindingPatternExt, FunctionExt};
+use rolldown_ecmascript_utils::FunctionExt;
 use rolldown_error::{BuildDiagnostic, BuildResult, CjsExportSpan};
 use rolldown_std_utils::PathExt;
 use rolldown_utils::concat_string;
@@ -47,8 +48,19 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use sugar_path::SugarPath;
 
+use bitflags::bitflags;
+
 use crate::SharedOptions;
 use crate::ast_scanner::cjs_export_analyzer::CommonjsExportSymbolUsage;
+
+bitflags! {
+  #[derive(Debug, Clone, Copy, Default)]
+  /// Tracks untranspiled syntax encountered during scanning.
+  pub(crate) struct UntranspiledSyntax: u8 {
+    const TypeScript = 1 << 0;
+    const Jsx = 1 << 1;
+  }
+}
 
 #[derive(Debug)]
 pub struct ScanResult {
@@ -84,6 +96,10 @@ pub struct ScanResult {
   /// `cjs_exports_ident` and `cjs_module_ident` only only recorded when they are appear in
   /// lhs of AssignmentExpression
   pub ast_usage: EcmaModuleAstUsage,
+  /// The span of the first top-level `await` keyword, if any. Routed into
+  /// a centralized map on the link stage instead of being stored on every
+  /// `EcmaView`, since top-level await is rare.
+  pub tla_keyword_span: Option<Span>,
   pub symbol_ref_db: SymbolRefDbForModule,
   /// https://github.com/evanw/esbuild/blob/d34e79e2a998c21bb71d57b92b0017ca11756912/internal/js_parser/js_parser_lower_class.go#L2277-L2283
   /// used for check if current class decl symbol was referenced in its class scope
@@ -105,18 +121,11 @@ pub struct ScanResult {
   pub directive_range: Vec<Span>,
   pub constant_export_map: FxHashMap<SymbolId, ConstExportMeta>,
   pub import_attribute_map: FxHashMap<ImportRecordIdx, ImportAttribute>,
-}
-
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy)]
-    struct TraverseState: u8 {
-        /// If this flag is set, all top level symbol id during traverse should be inserted into
-        /// [`rolldown_common::types::stmt_info::StmtInfos::symbol_ref_to_referenced_stmt_idx`]
-        const RootSymbolReferenceStmtInfoId = 1;
-        /// If current position all parent scopes are block scope or top level scope.
-        /// A cache state of [AstScanner::is_valid_tla_scope]
-        const TopLevel = 1 << 1;
-    }
+  /// Temporary storage for spans of `require()` calls in `module.exports = require(...)` patterns.
+  /// Resolved to `cjs_reexport_import_record_ids` after scanning completes.
+  pub cjs_reexport_require_spans: Vec<Span>,
+  /// Import record indices for `module.exports = require(...)` patterns.
+  pub cjs_reexport_import_record_ids: Vec<ImportRecordIdx>,
 }
 
 pub struct AstScannerImmutableCtx<'me, 'ast> {
@@ -150,8 +159,17 @@ pub struct AstScanner<'me, 'ast> {
   is_nested_this_inside_class: bool,
   /// Used in commonjs module it self
   cjs_named_exports_usage: FxHashMap<CompactStr, CommonjsExportSymbolUsage>,
-  traverse_state: TraverseState,
+  /// Set when `module.exports = <value>` is detected. All prior `exports.xxx`
+  /// constants are stale since the entire exports object is replaced at runtime.
+  has_module_exports_reassignment: bool,
+  /// Whether the current position is at the top level (all parent scopes are block or top-level).
+  /// A cache of [AstScanner::is_valid_tla_scope].
+  is_top_level: bool,
   current_comment_idx: usize,
+  untranspiled_syntax: UntranspiledSyntax,
+  /// Symbol IDs of namespace imports (`import * as ns from '...'`).
+  /// Used to treat property reads on namespace objects as side-effect-free.
+  namespace_object_symbol_ids: FxHashSet<SymbolId>,
 }
 
 impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
@@ -195,6 +213,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       errors: Vec::new(),
       ast_usage: EcmaModuleAstUsage::empty()
         .union(EcmaModuleAstUsage::AllStaticExportPropertyAccess),
+      tla_keyword_span: None,
       symbol_ref_db,
       self_referenced_class_decl_symbol_ids: FxHashSet::default(),
       hashbang_range: None,
@@ -209,6 +228,8 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       constant_export_map: FxHashMap::default(),
       ecma_view_meta: EcmaViewMeta::default(),
       import_attribute_map: FxHashMap::default(),
+      cjs_reexport_require_spans: Vec::new(),
+      cjs_reexport_import_record_ids: Vec::new(),
     };
 
     Self {
@@ -239,8 +260,11 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
         "__esModule".into(),
         CommonjsExportSymbolUsage { read: 0, write: 0, bailout: true },
       )]),
-      traverse_state: TraverseState::empty(),
+      has_module_exports_reassignment: false,
+      is_top_level: false,
       current_comment_idx: 0,
+      untranspiled_syntax: UntranspiledSyntax::empty(),
+      namespace_object_symbol_ids: FxHashSet::default(),
     }
   }
 
@@ -273,15 +297,14 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
     self.visit_program(program);
     let mut exports_kind = ExportsKind::None;
 
-    if self.esm_export_keyword.is_some() {
+    if let Some(esm_export_keyword) = self.esm_export_keyword {
       exports_kind = ExportsKind::Esm;
       if let Some(start) = self.cjs_module_ident {
         self.result.warnings.push(
           BuildDiagnostic::commonjs_variable_in_esm(
             self.immutable_ctx.id.to_string(),
             self.immutable_ctx.source.clone(),
-            // SAFETY: we checked at the beginning
-            self.esm_export_keyword.expect("should have start offset"),
+            esm_export_keyword,
             CjsExportSpan::Module(start),
           )
           .with_severity_warning(),
@@ -292,8 +315,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           BuildDiagnostic::commonjs_variable_in_esm(
             self.immutable_ctx.id.to_string(),
             self.immutable_ctx.source.clone(),
-            // SAFETY: we checked at the beginning
-            self.esm_export_keyword.expect("should have start offset"),
+            esm_export_keyword,
             CjsExportSpan::Exports(start),
           )
           .with_severity_warning(),
@@ -341,6 +363,14 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
 
     self.result.exports_kind = exports_kind;
 
+    // Resolve CJS re-export require spans to import record indices
+    self.result.cjs_reexport_import_record_ids = self
+      .result
+      .cjs_reexport_require_spans
+      .iter()
+      .filter_map(|span| self.result.imports.get(span).copied())
+      .collect();
+
     // If some commonjs module facade exports was used locally, we need to explicitly mark them as
     // has side effects, so that they should not be removed in linking stage.
     let mut bailout_inlined_cjs_exports_symbol_ids = FxHashSet::default();
@@ -374,6 +404,16 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
       && matches!(exports_kind, ExportsKind::None | ExportsKind::CommonJs)
     {
       self.result.ast_usage.insert(EcmaModuleAstUsage::ModuleRef);
+    }
+
+    // `module.exports = <value>` replaces the entire exports object, so all
+    // prior `exports.xxx` writes are stale and must not be inlined.
+    if self.has_module_exports_reassignment {
+      for exports in self.result.commonjs_exports.values() {
+        for local_export in exports {
+          bailout_inlined_cjs_exports_symbol_ids.insert(local_export.referenced.symbol);
+        }
+      }
     }
 
     self.result.constant_export_map.retain(|symbol_id, constant_meta| {
@@ -433,7 +473,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   }
 
   fn get_root_binding(&self, name: &str) -> Option<SymbolId> {
-    self.result.symbol_ref_db.scoping().get_root_binding(name)
+    self.result.symbol_ref_db.scoping().get_root_binding(name.into())
   }
 
   /// `is_dummy` means if it the import record is created during ast transformation.
@@ -505,21 +545,17 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
         span_imported,
       },
     );
+    self.namespace_object_symbol_ids.insert(local);
   }
 
   fn add_local_export(&mut self, export_name: &str, local: SymbolId, span: Span) {
     let symbol_ref: SymbolRef = (self.immutable_ctx.idx, local).into();
-
-    let is_const = self.result.symbol_ref_db.scoping().symbol_flags(local).is_const_variable();
 
     // If there is any write reference to the local variable, it is reassigned.
     let is_reassigned =
       self.result.symbol_ref_db.get_resolved_references(local).any(Reference::is_write);
 
     let ref_flags = symbol_ref.flags_mut(&mut self.result.symbol_ref_db);
-    if is_const {
-      ref_flags.insert(SymbolRefFlags::IsConst);
-    }
     if !is_reassigned {
       ref_flags.insert(SymbolRefFlags::IsNotReassigned);
     }
@@ -657,13 +693,13 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
     if let Some(exported) = &decl.exported {
       // export * as ns from '...'
       self.add_star_re_export(exported.name().as_str(), id, decl.span);
+      self.result.import_records[id].meta.insert(ImportRecordMeta::IsReExportOnly);
     } else {
       // export * from '...'
       self.result.import_records[id].meta.insert(ImportRecordMeta::IsExportStar);
       self.result.ecma_view_meta.insert(EcmaViewMeta::HasStarExport);
     }
     self.result.imports.insert(decl.span, id);
-    self.result.import_records[id].meta.insert(ImportRecordMeta::IsReExport);
     if let Some(ref with_clause) = decl.with_clause {
       self.result.import_attribute_map.insert(id, ImportAttribute::from_with_clause(with_clause));
     }
@@ -710,79 +746,75 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           .insert(record_idx, ImportAttribute::from_with_clause(with_clause));
       }
       self.result.imports.insert(decl.span, record_idx);
-      self.result.import_records[record_idx].meta.insert(ImportRecordMeta::IsReExport);
+      self.result.import_records[record_idx].meta.insert(ImportRecordMeta::IsReExportOnly);
     } else {
       decl.specifiers.iter().for_each(|spec| {
         if let Some(local_symbol_id) = self.get_root_binding(spec.local.name().as_str()) {
           self.add_local_export(spec.exported.name().as_str(), local_symbol_id, spec.span);
-        } else {
-          self.result.errors.push(BuildDiagnostic::export_undefined_variable(
-            self.immutable_ctx.id.to_string(),
-            self.immutable_ctx.source.clone(),
-            spec.local.span(),
-            ArcStr::from(spec.local.name().as_str()),
-          ));
         }
       });
       if let Some(decl) = decl.declaration.as_ref() {
         match decl {
           ast::Declaration::VariableDeclaration(var_decl) => {
             var_decl.declarations.iter().for_each(|decl| {
-              decl.id.binding_identifiers().into_iter().for_each(|id| {
-                self.add_local_export(&id.name, id.expect_symbol_id(), id.span);
+              decl.id.get_binding_identifiers().into_iter().for_each(|id| {
+                self.add_local_export(&id.name, id.symbol_id(), id.span);
               });
               if let BindingPattern::BindingIdentifier(ref binding) = decl.id {
                 let symbol_id = binding.symbol_id();
                 if let Some(value) = self.extract_constant_value_from_expr(decl.init.as_ref()) {
                   self.add_constant_symbol(symbol_id, ConstExportMeta::new(value, false));
                 }
-                let is_side_effect_free_function = decl
+                let (is_side_effect_free_function, is_pure_annotation_only) = decl
                   .init
                   .as_ref()
                   .map(|expr| match expr {
-                    Expression::FunctionExpression(func) => func.is_side_effect_free() || func.pure,
-                    Expression::ArrowFunctionExpression(func) => {
-                      func.is_side_effect_free() || func.pure
+                    Expression::FunctionExpression(func) => {
+                      let empty = func.is_side_effect_free();
+                      (empty || func.pure, func.pure && !empty)
                     }
-                    _ => false,
+                    Expression::ArrowFunctionExpression(func) => {
+                      let empty = func.is_side_effect_free();
+                      (empty || func.pure, func.pure && !empty)
+                    }
+                    _ => (false, false),
                   })
-                  .unwrap_or(false);
+                  .unwrap_or((false, false));
                 if is_side_effect_free_function {
                   self
                     .result
                     .ecma_view_meta
                     .insert(EcmaViewMeta::TopExportedSideEffectsFreeFunction);
-                  self
-                    .result
-                    .symbol_ref_db
-                    .flags
-                    .entry(symbol_id)
-                    .or_default()
-                    .insert(SymbolRefFlags::SideEffectsFreeFunction);
+                  let flags = self.result.symbol_ref_db.flags.entry(symbol_id).or_default();
+                  flags.insert(SymbolRefFlags::SideEffectsFreeFunction);
+                  if is_pure_annotation_only {
+                    flags.insert(SymbolRefFlags::PureAnnotationOnly);
+                  }
                 }
               }
             });
           }
           ast::Declaration::FunctionDeclaration(fn_decl) => {
             let binding_id = fn_decl.id.as_ref().unwrap();
-            let symbol_id = binding_id.expect_symbol_id();
+            let symbol_id = binding_id.symbol_id();
             self.add_local_export(binding_id.name.as_str(), symbol_id, binding_id.span);
-            if fn_decl.is_side_effect_free() || fn_decl.pure {
+            let empty = fn_decl.is_side_effect_free();
+            if empty || fn_decl.pure {
               self.result.ecma_view_meta.insert(EcmaViewMeta::TopExportedSideEffectsFreeFunction);
-              self
-                .result
-                .symbol_ref_db
-                .flags
-                .entry(symbol_id)
-                .or_default()
-                .insert(SymbolRefFlags::SideEffectsFreeFunction);
+              let flags = self.result.symbol_ref_db.flags.entry(symbol_id).or_default();
+              flags.insert(SymbolRefFlags::SideEffectsFreeFunction);
+              if fn_decl.pure && !empty {
+                flags.insert(SymbolRefFlags::PureAnnotationOnly);
+              }
             }
           }
           ast::Declaration::ClassDeclaration(cls_decl) => {
             let id = cls_decl.id.as_ref().unwrap();
-            self.add_local_export(id.name.as_str(), id.expect_symbol_id(), id.span);
+            self.add_local_export(id.name.as_str(), id.symbol_id(), id.span);
           }
-          _ => unreachable!("doesn't support ts now"),
+          _ => {
+            self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+          }
         }
       }
     }
@@ -802,32 +834,62 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   fn scan_export_default_decl(&mut self, decl: &ExportDefaultDeclaration) {
     use oxc::ast::ast::ExportDefaultDeclarationKind;
     let local_binding_for_default_export = match &decl.declaration {
-      oxc::ast::match_expression!(ExportDefaultDeclarationKind) => None,
+      ast::ExportDefaultDeclarationKind::Identifier(id) => {
+        if let Some(symbol_id) = self.resolve_symbol_from_reference(id) {
+          let scoping = self.result.symbol_ref_db.ast_scopes.scoping();
+          let symbol_id_span = scoping.symbol_span(symbol_id);
+
+          // We can only reuse the symbol if all the following conditions are met:
+          // 1. Declaration is before `export default` (not: `export default foo; const foo = 1;`)
+          // 2. Symbol is not an imported binding (not: `import { foo } from './other'; export default foo;`)
+          // 3. Symbol has no redeclarations (not: `var foo = 1; var foo = 2; export default foo;`)
+          // 4. Symbol has no write references (not: `let foo = 1; foo = 2; export default foo;`)
+          // See https://github.com/rollup/rollup/blob/061a0387/test/function/samples/default-export-before-declaration
+          let cannot_reuse_symbol = (id.span.is_unspanned()
+            || symbol_id_span.is_unspanned()
+            || symbol_id_span.start > id.span.start)
+            || scoping.symbol_flags(symbol_id).is_import()
+            || !scoping.symbol_redeclarations(symbol_id).is_empty()
+            || scoping.get_resolved_references(symbol_id).any(Reference::is_write);
+          if !cannot_reuse_symbol {
+            self.result.default_export_ref.symbol = symbol_id;
+          }
+        }
+        None
+      }
       ast::ExportDefaultDeclarationKind::FunctionDeclaration(fn_decl) => {
-        if fn_decl.is_side_effect_free() || fn_decl.pure {
+        let empty = fn_decl.is_side_effect_free();
+        if empty || fn_decl.pure {
           self.result.ecma_view_meta.insert(EcmaViewMeta::TopExportedSideEffectsFreeFunction);
-          self
+          let flags = self
             .result
             .symbol_ref_db
             .flags
             .entry(self.result.default_export_ref.symbol)
-            .or_default()
-            .insert(SymbolRefFlags::SideEffectsFreeFunction);
+            .or_default();
+          flags.insert(SymbolRefFlags::SideEffectsFreeFunction);
+          if fn_decl.pure && !empty {
+            flags.insert(SymbolRefFlags::PureAnnotationOnly);
+          }
         }
         fn_decl.id.as_ref().map(|id| {
-          let symbol_id = rolldown_ecmascript_utils::BindingIdentifierExt::expect_symbol_id(id);
+          let symbol_id = id.symbol_id();
           self.result.default_export_ref.symbol = symbol_id;
           (symbol_id, id.span)
         })
       }
       ast::ExportDefaultDeclarationKind::ClassDeclaration(cls_decl) => {
         cls_decl.id.as_ref().map(|id| {
-          let symbol_id = rolldown_ecmascript_utils::BindingIdentifierExt::expect_symbol_id(id);
+          let symbol_id = id.symbol_id();
           self.result.default_export_ref.symbol = symbol_id;
           (symbol_id, id.span)
         })
       }
-      ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => unreachable!(),
+      ast::ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => {
+        self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+        None
+      }
+      oxc::ast::match_expression!(ExportDefaultDeclarationKind) => None,
     };
     let (reference, span) = local_binding_for_default_export
       .unwrap_or((self.result.default_export_ref.symbol, Span::default()));
@@ -864,16 +926,16 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
     let Some(specifiers) = &decl.specifiers else { return };
     specifiers.iter().for_each(|spec| match spec {
       ast::ImportDeclarationSpecifier::ImportSpecifier(spec) => {
-        let sym = spec.local.expect_symbol_id();
+        let sym = spec.local.symbol_id();
         let imported = spec.imported.name();
         self.add_named_import(sym, imported.as_str(), rec_id, spec.imported.span());
       }
       ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(spec) => {
-        self.add_named_import(spec.local.expect_symbol_id(), "default", rec_id, spec.span);
+        self.add_named_import(spec.local.symbol_id(), "default", rec_id, spec.span);
       }
       ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(spec) => {
-        let symbol_id = spec.local.expect_symbol_id();
-        self.add_star_import(symbol_id, rec_id, spec.span);
+        let symbol_id = spec.local.symbol_id();
+        self.add_star_import(symbol_id, rec_id, spec.local.span());
       }
     });
   }
@@ -917,14 +979,31 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   pub fn add_member_expr_reference(
     &mut self,
     object_ref: SymbolRef,
-    prop_and_span_list: Vec<(CompactStr, Span)>,
+    prop_and_span_list: Vec<MemberExprProp>,
     span: Span,
     obj_ref_type: MemberExprObjectReferencedType,
     reference_id: Option<ReferenceId>,
+    is_write: bool,
   ) {
     self.current_stmt_info.referenced_symbols.push(
-      MemberExprRef::new(object_ref, prop_and_span_list, span, obj_ref_type, reference_id).into(),
+      MemberExprRef::new(
+        object_ref,
+        prop_and_span_list,
+        span,
+        obj_ref_type,
+        reference_id,
+        is_write,
+      )
+      .into(),
     );
+  }
+
+  /// Check if this identifier reference is the object of a member expression in a write context
+  /// (e.g., `A` in `A.foo = 1`, `A.foo += 1`, `A.foo++`, `delete A.foo`).
+  fn is_member_write_target(&self, ident_ref: &IdentifierReference) -> bool {
+    ident_ref.reference_id.get().is_some_and(|ref_id| {
+      self.result.symbol_ref_db.scoping().get_reference(ref_id).flags().is_member_write_target()
+    })
   }
 
   fn is_root_symbol(&self, symbol_id: SymbolId) -> bool {
@@ -968,19 +1047,27 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   pub fn try_extract_parent_static_member_expr_chain(
     &self,
     max_len: usize,
-  ) -> Option<(Span, Vec<(CompactStr, Span)>)> {
+  ) -> Option<(Span, Vec<MemberExprProp>)> {
     let mut span = SPAN;
     let mut props = vec![];
     for ancestor_ast in self.visit_path.iter().rev().take(max_len) {
       match ancestor_ast {
         AstKind::StaticMemberExpression(expr) => {
           span = ancestor_ast.span();
-          props.push((expr.property.name.as_str().into(), expr.property.span()));
+          props.push(MemberExprProp {
+            name: expr.property.name.as_str().into(),
+            span: expr.property.span(),
+            optional: expr.optional,
+          });
         }
         AstKind::ComputedMemberExpression(expr) => {
           if let Some(name) = expr.static_property_name() {
             span = ancestor_ast.span();
-            props.push((name.into(), expr.expression.span()));
+            props.push(MemberExprProp {
+              name: name.into(),
+              span: expr.expression.span(),
+              optional: expr.optional,
+            });
           } else {
             break;
           }
@@ -1040,7 +1127,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   }
 
   pub fn add_constant_symbol(&mut self, symbol_id: SymbolId, value: ConstExportMeta) {
-    let is_mutated = !self.result.symbol_ref_db.ast_scopes.is_facade_symbol(symbol_id)
+    let is_mutated = !self.result.symbol_ref_db.is_facade_symbol(symbol_id)
       && self.result.symbol_ref_db.scoping().symbol_is_mutated(symbol_id);
     if is_mutated {
       return;

@@ -6,17 +6,13 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## src_entry.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-//#region node_modules/demo-pkg/index.js
-var require_demo_pkg = /* @__PURE__ */ __commonJSMin(((exports) => {
+// HIDDEN [\0rolldown/runtime.js]
+//#region src/entry.js
+(/* @__PURE__ */ __commonJSMin(((exports) => {
 	exports.foo = 123;
 	console.log("hello");
-}));
-
-//#endregion
-//#region src/entry.js
-require_demo_pkg();
+})))();
 console.log("unused import");
-
 //#endregion
+
 ```

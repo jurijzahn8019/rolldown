@@ -101,7 +101,7 @@ Build hooks are run during the build phase. They are mainly concerned with locat
 
 The first hook of the build phase is [`options`](/reference/Interface.Plugin#options), the last one is always [`buildEnd`](/reference/Interface.Plugin#buildend). If there is a build error, [`closeBundle`](/reference/Interface.Plugin#closebundle) will be called after that.
 
-```hooks-graph
+```dot+hooks-graph
 # styles
 sequential: fillcolor="#ffe8cc", dark$fillcolor="#9d4f1a"
 parallel: fillcolor="#ffcccc", dark$fillcolor="#8a2a2a"
@@ -161,7 +161,7 @@ The first hook of the output generation phase is [`renderStart`](/reference/Inte
 
 Additionally, [`closeBundle`](/reference/Interface.Plugin#closebundle) can be called as the very last hook, but it is the responsibility of the User to manually call [`bundle.close()`](/reference/Interface.RolldownBuild#close) to trigger this. The CLI will always make sure this is the case.
 
-```hooks-graph
+```dot+hooks-graph
 # config
 margin=150,0
 
@@ -236,6 +236,18 @@ The following Output Generation Hooks are supported by Rollup, but not by Rolldo
 
 A number of utility functions and informational bits can be accessed from within most hooks via `this`. See the [`PluginContext`](/reference/Interface.PluginContext) type for more information.
 
+## Supporting TypeScript and JSX
+
+To achieve optimal performance, Rolldown runs the internal transform which transforms TypeScript and JSX to JavaScript after the [`transform`](/reference/Interface.Plugin#transform) hooks are called. This means the plugins using `transform` hook need to support TypeScript and JSX. Basically, there are two ways to achieve this.
+
+### Handling TypeScript and JSX Syntax
+
+[`this.parse`](/reference/Interface.PluginContext#parse) supports parsing TypeScript and JSX by passing the `lang` option. This should allow the plugin to process TypeScript and JSX easily.
+
+### Transforming TypeScript and JSX beforehand
+
+If processing TypeScript and JSX AST is not an option, you can still transform them to JavaScript by using the `transform` function exposed from `rolldown/utils`. Note that this has an additional overhead.
+
 ## Notable Differences from Rollup
 
 While Rolldown's plugin interface is largely compatible with Rollup's, there are some important behavioral differences to be aware of:
@@ -249,6 +261,10 @@ These are the concrete differences:
 - [`outputOptions`](/reference/Interface.FunctionPluginHooks#outputoptions) hook is called **before** the build hooks in Rolldown, whereas Rollup calls them **after** the build hooks
 - Build hooks are called for each output separately, whereas Rollup calls them once for all outputs
 - [`closeBundle`](/reference/Interface.FunctionPluginHooks#closebundle) hook is called **only** when you called [`generate()`](/reference/Interface.RolldownBuild#generate) or [`write()`](/reference/Interface.RolldownBuild#write) at least once, whereas Rollup calls it regardless of whether you called `generate()` or `write()`
+
+### Watch Mode Hook Behavior
+
+In Rollup, the [`options`](/reference/Interface.Plugin#options) hook is called on every rebuild in watch mode. In Rolldown, the `options` hook is only called once when the watcher is created, and is not called again on subsequent rebuilds.
 
 ### Sequential Hook Execution
 

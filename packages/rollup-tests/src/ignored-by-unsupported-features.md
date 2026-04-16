@@ -18,6 +18,7 @@
 
 ### The `resolveDynamicImport` hook `specifier: AstNode` not supported
  - rollup@form@dynamic-import-unresolvable: Returns the raw AST nodes for unresolvable dynamic imports@generates es
+ - rollup@function@dynamic-import-expression: Dynamic import expression replacement
 
 ### The plugin `sequential` is not supported
  - rollup@function@enforce-sequential-plugin-order: allows to enforce sequential plugin hook order for parallel plugin hooks
@@ -116,11 +117,6 @@
  - rollup@function@adds-timings-to-bundle-when-codesplitting: Adds timing information to bundle when bundling with perf=true
  - rollup@function@adds-timings-to-bundle: Adds timing information to bundle when bundling with perf=true
 
-### `output.dynamicImportInCjs` is not compatible yet
- - rollup@function@dynamic-import-this-function: uses correct "this" in dynamic imports when not using arrow functions
- - rollup@function@dynamic-import-this-arrow: uses correct "this" in dynamic imports when using arrow functions
- - rollup@function@dynamic-import-expression: Dynamic import expression replacement
-
 ### The `input.moduleContext` is not supported
  - rollup@form@custom-module-context-function: allows custom module-specific context with a function option
  - rollup@form@custom-module-context: allows custom module-specific context@generates es
@@ -216,8 +212,6 @@
  - rollup@function@amd-base-path-id: throws when using both the amd.basePath and the amd.id option
  - rollup@function@amd-base-path: throws when using only amd.basePath option
 
-### The `output.sourcemapExcludeSources` is not supported
- - rollup@form@sourcemaps-excludesources: correct sourcemaps are written (excluding sourceContent)@generates es
 
 ### The `output.sourcemapBaseUrl` is not compatible yet
  - rollup@function@sourcemap-base-url-invalid: throws for invalid sourcemapBaseUrl
@@ -298,6 +292,17 @@
  - rollup@form@import-attributes@keeps-static-attributes-key-assert: keeps any import attributes on input using import attributes with "with" key@generates es
  - rollup@form@import-attributes@keeps-static-attributes-key-default: keeps any import attributes on input using import attributes with "with" key@generates es
  - rollup@form@import-attributes@keeps-static-attributes-key-with: keeps any import attributes on input using import attributes with "with" key@generates es
+ - rollup@form@resolve-file-url-import-meta-attributes: adds attributes to file resolveFileUrl and resolveImportMeta hooks@generates es
+ - rollup@function@deprecated@load-attributes: does not allow returning attributes from the "load" hook
+ - rollup@function@deprecated@transform-attributes: does not allow returning attributes from the "transform" hook
+ - rollup@function@extend-more-hooks-to-include-import-attributes: extend load, transform and renderDynamicImport to include import attributes
+
+### Source phase import is not supported
+ - rollup@form@source-phase-imports-external: preserves source phase import externals
+ - rollup@function@source-phase-dynamic-import-error-resolved: throws for non-external dynamic source phase imports with dynamic attributes
+ - rollup@function@source-phase-dynamic-import-error: throws for non-external dynamic source phase imports
+ - rollup@function@source-phase-format-unsupported: throws for source phase imports in non-ES output formats
+ - rollup@function@source-phase-import-error: throws for non-external source phase imports
 
 ### watch behavior is not compatible yet
  - rollup@hooks@allows to enforce plugin hook order in watch mode
@@ -416,3 +421,4 @@
  - rollup@function@ast-validations@redeclare-import-var: throws when redeclaring an import with a var (https://github.com/oxc-project/oxc/issues/15961)
  - rollup@function@warn-on-top-level-this: warns on top-level this (#770) (`THIS_IS_UNDEFINED` warning)
  - rollup@sourcemaps@warning-with-coarse-sourcemap: get correct mapping location with coarse sourcemap@generates es (`THIS_IS_UNDEFINED` warning)
+ - rollup@function@circular-namespace-reexport-cache: handles cyclic reexports through cached namespace reexports for multiple importers (`CYCLIC_CROSS_CHUNK_REEXPORT` warning)

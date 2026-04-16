@@ -10,6 +10,12 @@ import type { TreeshakingOptions } from '../types/module-side-effects';
 import type { NullValue, StringOrRegExp } from '../types/utils';
 import type { ChecksOptions } from './generated/checks-options';
 import type { TransformOptions } from './transform-options';
+// oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
+import type { watch } from '../api/watch/index';
+// oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
+import type { Plugin } from '../plugin';
+// oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
+import type { RolldownBuild } from '../api/rolldown/rolldown-build';
 
 /**
  * @inline
@@ -45,11 +51,59 @@ export type ModuleTypes = Record<
   | 'empty'
   | 'css'
   | 'asset'
+  | 'copy'
 >;
+
+export interface WatcherFileWatcherOptions {
+  /**
+   * Whether to use polling-based file watching instead of native OS events.
+   *
+   * Polling is useful for environments where native FS events are unreliable,
+   * such as network mounts, Docker volumes, or WSL2.
+   *
+   * @default false
+   */
+  usePolling?: boolean;
+  /**
+   * Interval between each poll in milliseconds.
+   *
+   * This option is only used when {@linkcode usePolling} is `true`.
+   *
+   * @default 100
+   */
+  pollInterval?: number;
+  /**
+   * Whether to compare file contents for poll-based watchers.
+   * When enabled, poll watchers will check file contents to determine if they actually changed.
+   *
+   * This option is only used when {@linkcode usePolling} is `true`.
+   *
+   * @default false
+   */
+  compareContentsForPolling?: boolean;
+  /**
+   * Whether to use debounced event delivery at the filesystem level.
+   * This coalesces rapid filesystem events before they reach the build coordinator.
+   * @default false
+   */
+  useDebounce?: boolean;
+  /**
+   * Debounce delay in milliseconds for fs-level debounced watchers.
+   * Only used when {@linkcode useDebounce} is `true`.
+   * @default 10
+   */
+  debounceDelay?: number;
+  /**
+   * Tick rate in milliseconds for the debouncer's internal polling.
+   * Only used when {@linkcode useDebounce} is `true`.
+   * When undefined, auto-selects 1/4 of debounceDelay.
+   */
+  debounceTickRate?: number;
+}
 
 export interface WatcherOptions {
   /**
-   * Whether to skip the `bundle.write()` step when a rebuild is triggered.
+   * Whether to skip the {@linkcode RolldownBuild.write | bundle.write()} step when a rebuild is triggered.
    * @default false
    */
   skipWrite?: boolean;
@@ -63,36 +117,22 @@ export interface WatcherOptions {
    * configured number of milliseconds. If several configurations are watched,
    * Rolldown will use the largest configured build delay.
    *
+   * This option is useful if you use a tool that regenerates multiple source files
+   * very slowly. Rebuilding immediately after the first change could cause Rolldown
+   * to generate a broken intermediate build before generating a successful final
+   * build, which can be confusing and distracting.
+   *
    * @default 0
    */
   buildDelay?: number;
   /**
-   * An optional object of options that will be passed to the [notify](https://github.com/rolldown/notify) file watcher.
+   * File watcher options for configuring how file changes are detected.
    */
-  notify?: {
-    /**
-     * Interval between each re-scan attempt in milliseconds.
-     *
-     * This option is only used when polling backend is used.
-     *
-     * @default 30_000
-     */
-    pollInterval?: number;
-    /**
-     * Whether to compare file contents when checking for changes.
-     *
-     * This is especially important for pseudo filesystems like those on Linux
-     * under `/sys` and `/proc` which are not obligated to respect any other
-     * filesystem norms such as modification timestamps, file sizes, etc. By
-     * enabling this feature, performance will be significantly impacted as
-     * all files will need to be read and hashed at each interval.
-     *
-     * This option is only used when polling backend is used.
-     *
-     * @default false
-     */
-    compareContents?: boolean;
-  };
+  watcher?: WatcherFileWatcherOptions;
+  /**
+   * @deprecated Use {@linkcode watcher} instead.
+   */
+  notify?: WatcherFileWatcherOptions;
   /**
    * Filter to limit the file-watching to certain files.
    *
@@ -131,7 +171,7 @@ export interface WatcherOptions {
    * An optional function that will be called immediately every time
    * a module changes that is part of the build.
    *
-   * This is different from the `watchChange` plugin hook, which is
+   * This is different from the {@linkcode Plugin.watchChange | watchChange} plugin hook, which is
    * only called once the running build has finished. This may for
    * instance be used to prevent additional steps from being performed
    * if we know another build will be started anyway once the current
@@ -199,7 +239,7 @@ export type OptimizationOptions = {
    * console.log(API_URL);
    * ```
    *
-   * @default false
+   * @default { mode: 'smart', pass: 1 }
    */
   inlineConst?: boolean | { mode?: 'all' | 'smart'; pass?: number };
 
@@ -246,6 +286,21 @@ export interface InputOptions {
    * Falsy plugins will be ignored, which can be used to easily activate or deactivate plugins. Nested plugins will be flattened. Async plugins will be awaited and resolved.
    *
    * See [Plugin API document](https://rolldown.rs/apis/plugin-api) for more details about creating plugins.
+   *
+   * @example
+   * ```js
+   * import { defineConfig } from 'rolldown'
+   *
+   * export default defineConfig({
+   *   plugins: [
+   *     examplePlugin1(),
+   *     // Conditional plugins
+   *     process.env.ENV1 && examplePlugin2(),
+   *     // Nested plugins arrays are flattened
+   *     [examplePlugin3(), examplePlugin4()],
+   *   ]
+   * })
+   * ```
    */
   plugins?: RolldownPluginOption;
   /**
@@ -272,7 +327,7 @@ export interface InputOptions {
      * }
      * ```
      * > [!WARNING]
-     * > `resolve.alias` will not call `resolveId` hooks of other plugin.
+     * > `resolve.alias` will not call [`resolveId`](/reference/Interface.Plugin#resolveid) hooks of other plugin.
      * > If you want to call `resolveId` hooks of other plugin, use `viteAliasPlugin` from `rolldown/experimental` instead.
      * > You could find more discussion in [this issue](https://github.com/rolldown/rolldown/issues/3615)
      */
@@ -380,6 +435,8 @@ export interface InputOptions {
   /**
    * Controls tree-shaking (dead code elimination).
    *
+   * See the [In-depth Dead Code Elimination Guide](https://rolldown.rs/in-depth/dead-code-elimination) for more details.
+   *
    * When `false`, tree-shaking will be disabled.
    * When `true`, it is equivalent to setting each options to the default value.
    *
@@ -430,7 +487,20 @@ export interface InputOptions {
   /**
    * Maps file patterns to module types, controlling how files are processed.
    *
-   * This is conceptually similar to esbuild's loader option, allowing you to specify how different file extensions should be handled.
+   * This is conceptually similar to [esbuild's `loader`](https://esbuild.github.io/api/#loader) option, allowing you to specify how each file extensions should be handled.
+   *
+   * See [the In-Depth Guide](https://rolldown.rs/in-depth/module-types) for more details.
+   *
+   * @example
+   * ```js
+   * import { defineConfig } from 'rolldown'
+   *
+   * export default defineConfig({
+   *   moduleTypes: {
+   *     '.frag': 'text',
+   *   }
+   * })
+   * ```
    */
   moduleTypes?: ModuleTypes;
   /**
@@ -498,6 +568,8 @@ export interface InputOptions {
      * - `full`: Attach detailed debug information to the output bundle. These comments are using legal comment syntax, so they won't be removed by the minifier.
      *
      * @default 'simple'
+     *
+     * {@include ./docs/experimental-attach-debug-info.md}
      */
     attachDebugInfo?: AttachDebugOptions;
     /**
@@ -549,6 +621,7 @@ export interface InputOptions {
      * @default false
      */
     chunkImportMap?: boolean | { baseUrl?: string; fileName?: string };
+
     /**
      * Enable on-demand wrapping of modules.
      * @default false
@@ -560,11 +633,6 @@ export interface InputOptions {
      * @default false
      */
     incrementalBuild?: boolean;
-    /**
-     * Enable high-resolution source maps for transform operations.
-     * @default false
-     */
-    transformHiresSourcemap?: boolean | 'boundary';
     /**
      * Use native Rust implementation of MagicString for source map generation.
      *
@@ -647,7 +715,11 @@ export interface InputOptions {
   /**
    * Watch mode related options.
    *
-   * These options only take effect when running with the `--watch` flag, or using `rolldown.watch()` API.
+   * These options only take effect when running with the [`--watch`](/apis/cli#w-watch) flag, or using {@linkcode watch | watch()} API.
+   *
+   * {@include ./docs/watch.md}
+   *
+   * @experimental
    */
   watch?: WatcherOptions | false;
   /**

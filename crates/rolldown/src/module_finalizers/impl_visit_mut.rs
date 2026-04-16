@@ -1,10 +1,9 @@
 use itertools::Itertools;
 use oxc::allocator::FromIn;
 use oxc::ast::AstType;
-use oxc::ast::ast::{AssignmentTarget, JSXMemberExpression};
-use oxc::span::{Atom, CompactStr};
+use oxc::ast::ast::{AssignmentTarget, JSXMemberExpression, Str};
 use oxc::{
-  allocator::{self, IntoIn, TakeIn},
+  allocator::{self, Dummy as _, IntoIn, TakeIn},
   ast::{
     NONE,
     ast::{self, BindingPattern, Expression, SimpleAssignmentTarget, Statement},
@@ -14,6 +13,7 @@ use oxc::{
   semantic::ScopeFlags,
   span::{SPAN, Span},
 };
+use oxc_str::CompactStr;
 use rolldown_common::{ConcatenateWrappedModuleKind, SymbolRef, ThisExprReplaceKind, WrapKind};
 use rolldown_ecmascript::ToSourceString;
 use rolldown_ecmascript_utils::{ExpressionExt, JsxExt};
@@ -111,7 +111,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
       .ctx
       .linking_info
       .wrapper_stmt_info
-      .is_some_and(|idx| self.ctx.linking_info.stmt_info_included[idx])
+      .is_some_and(|idx| self.ctx.linking_info.stmt_info_included.has_bit(idx))
       .then_some(self.ctx.linking_info.wrap_kind());
 
     self.needs_hosted_top_level_binding = matches!(included_wrap_kind, Some(WrapKind::Esm));
@@ -135,7 +135,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
         .stmt_infos
         .declared_stmts_by_symbol(symbol_ref)
         .iter()
-        .any(|id| self.ctx.linking_info.stmt_info_included[*id]);
+        .any(|id| self.ctx.linking_info.stmt_info_included.has_bit(*id));
       if is_included {
         let canonical_name = self.canonical_name_for(*symbol_ref);
         program.body.push(self.snippet.var_decl_stmt(canonical_name, self.snippet.void_zero()));
@@ -307,7 +307,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
       assert!(symbol.namespace_alias.is_none());
       let canonical_name = self.canonical_name_for(symbol_ref);
       if ident.name != canonical_name {
-        ident.name = self.snippet.atom(canonical_name);
+        ident.name = self.snippet.atom(canonical_name).into();
       }
       ident.symbol_id.get_mut().take();
     } else {
@@ -368,6 +368,52 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
   }
 
   fn visit_expression(&mut self, expr: &mut ast::Expression<'ast>) {
+    // Handle keep_names for named class/function expressions in any expression context
+    // (return statements, function args, array elements, etc.)
+    if self.ctx.options.keep_names && self.ctx.runtime.id() != self.ctx.idx {
+      match expr {
+        ast::Expression::ClassExpression(class_expression) => {
+          if let Some(id) = class_expression.id.as_ref() {
+            if let Some(element) = self.keep_name_helper_for_class(
+              id.symbol_id.get().map(KeepNameId::SymbolId),
+              &class_expression.body,
+            ) {
+              class_expression.body.body.insert(0, element);
+            }
+          }
+        }
+        ast::Expression::FunctionExpression(fn_expression) => {
+          if let Some(id) = fn_expression.id.as_mut() {
+            if let Some(symbol_id) = id.symbol_id.get() {
+              let keep_name_id = KeepNameId::SymbolId(symbol_id);
+              if let Some((_insert_position, original_name, _)) =
+                self.process_fn(Some(keep_name_id), Some(keep_name_id))
+              {
+                // Manually rename the binding identifier before clearing symbol_id
+                let symbol_ref: SymbolRef = (self.ctx.idx, symbol_id).into();
+                let canonical_name = self.canonical_name_for(symbol_ref);
+                if id.name != canonical_name {
+                  id.name = self.snippet.atom(canonical_name).into();
+                }
+                // Clear symbol_id to prevent double processing:
+                // - visit_expression won't re-wrap when walker visits inner fn
+                // - visit_binding_identifier won't re-rename
+                id.symbol_id.get_mut().take();
+
+                let fn_expr = expr.take_in(self.alloc);
+                let name_ref = self.canonical_ref_for_runtime("__name");
+                let (finalized_callee, _) =
+                  self.finalized_expr_for_symbol_ref(name_ref, false, false);
+                *expr =
+                  self.snippet.keep_name_call_expr(&original_name, fn_expr, finalized_callee, true);
+              }
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+
     match expr {
       ast::Expression::CallExpression(call_expr) => {
         self.rewrite_hot_accept_call_deps(call_expr);
@@ -380,7 +426,8 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
             .and_then(|ref_id| self.scope.scoping().get_reference(ref_id).symbol_id())
             .map(|id| {
               let symbol_ref = self.ctx.symbol_db.canonical_ref_for((self.ctx.idx, id).into());
-              self.ctx.side_effect_free_function_symbols.contains(&symbol_ref)
+              symbol_ref.is_side_effect_free_function(self.ctx.symbol_db, self.ctx.modules)
+                && symbol_ref.is_not_reassigned(self.ctx.symbol_db) == Some(true)
             })
             .unwrap_or(false);
           if is_empty_function {
@@ -422,7 +469,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
             ThisExprReplaceKind::Context => {
               *expr = self.snippet.builder.expression_identifier(
                 SPAN,
-                Atom::from_in(self.ctx.options.context.as_str(), self.alloc),
+                Str::from_in(self.ctx.options.context.as_str(), self.alloc),
               );
             }
           }
@@ -437,19 +484,58 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
         }
       }
       ast::Expression::ChainExpression(chain_expr) => {
+        let chain_span = chain_expr.span;
         if let Some(new_expr) = chain_expr
           .expression
           .as_member_expression_mut()
           .and_then(|expr| self.try_rewrite_member_expr(expr))
         {
-          *expr = new_expr;
+          // If the rewritten expression contains optional member accesses (?.),
+          // it must remain wrapped in a ChainExpression for valid JavaScript output.
+          if has_optional_member_access(&new_expr) {
+            match new_expr {
+              ast::Expression::StaticMemberExpression(member) => {
+                *expr = self
+                  .snippet
+                  .builder
+                  .expression_chain(chain_span, ast::ChainElement::StaticMemberExpression(member));
+              }
+              ast::Expression::ComputedMemberExpression(member) => {
+                *expr = self.snippet.builder.expression_chain(
+                  chain_span,
+                  ast::ChainElement::ComputedMemberExpression(member),
+                );
+              }
+              _ => {
+                *expr = new_expr;
+              }
+            }
+          } else {
+            *expr = new_expr;
+          }
         }
       }
       _ => {
+        // Try to inline enum member accesses (e.g., `Direction.Up` → `0`, `ns.c.x` → `"c"`)
+        if self.ctx.has_enum_inlining {
+          if let Some(new_expr) = self.try_inline_enum_access(expr) {
+            *expr = new_expr;
+            self.rewrite_import_meta_hot(expr);
+            walk_mut::walk_expression(self, expr);
+            return;
+          }
+        }
         if let Some(new_expr) =
           expr.as_member_expression().and_then(|expr| self.try_rewrite_member_expr(expr))
         {
           *expr = new_expr;
+          // After namespace rewriting (e.g., `ns.c` → `c`), the result may be
+          // an enum member access that can be inlined.
+          if self.ctx.has_enum_inlining {
+            if let Some(inlined) = self.try_inline_enum_access(expr) {
+              *expr = inlined;
+            }
+          }
         }
       }
     }
@@ -471,9 +557,18 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
             Expression::Identifier(ident_ref) => {
               *it = ast::JSXElementName::IdentifierReference(ident_ref);
             }
+            Expression::StaticMemberExpression(member_expr) => {
+              *it = ast::JSXElementName::MemberExpression(oxc::allocator::Box::new_in(
+                JSXMemberExpression::from_ast(member_expr.unbox(), self.alloc).unwrap(),
+                self.alloc,
+              ));
+            }
+            Expression::ThisExpression(this_expr) => {
+              *it = ast::JSXElementName::ThisExpression(this_expr);
+            }
             _ => {
               unreachable!(
-                "Should always rewrite to Identifier for JsxElementName::IdentifierReference"
+                "Should always rewrite to Identifier, StaticMemberExpression, or ThisExpression for JsxElementName::IdentifierReference"
               )
             }
           }
@@ -582,6 +677,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
                   binding: ast::AssignmentTarget::from(target),
                   init,
                   span: Span::default(),
+                  ..ast::AssignmentTargetWithDefault::dummy(self.alloc)
                 }
                 .into_in(self.alloc),
               )
@@ -590,6 +686,7 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
             },
             span: Span::default(),
             computed: false,
+            ..ast::AssignmentTargetPropertyProperty::dummy(self.alloc)
           }
           .into_in(self.alloc),
         );
@@ -662,10 +759,20 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
         ) {
           decl.body.body.insert(0, element);
         }
-        if let Some(decl) = self.get_transformed_class_decl(decl) {
-          *it = decl;
+        if let Some(new_decl) = self.get_transformed_class_decl(decl) {
+          *it = new_decl;
+          // Clear symbol_id on class expression's id to prevent visit_expression
+          // from inserting a duplicate __name static block during walk
+          if let ast::Declaration::VariableDeclaration(var_decl) = it {
+            if let Some(declarator) = var_decl.declarations.first_mut() {
+              if let Some(ast::Expression::ClassExpression(class_expr)) = &mut declarator.init {
+                if let Some(id) = &mut class_expr.id {
+                  id.symbol_id.get_mut().take();
+                }
+              }
+            }
+          }
         }
-        // deconflict class name
       }
       ast::Declaration::TSTypeAliasDeclaration(_)
       | ast::Declaration::TSInterfaceDeclaration(_)
@@ -676,5 +783,27 @@ impl<'ast> VisitMut<'ast> for ScopeHoistingFinalizer<'_, 'ast> {
     }
 
     walk_mut::walk_declaration(self, it);
+  }
+}
+
+/// Check if an expression tree contains any optional member accesses (`?.`).
+fn has_optional_member_access(expr: &Expression) -> bool {
+  let mut cur = expr;
+  loop {
+    match cur {
+      Expression::StaticMemberExpression(e) => {
+        if e.optional {
+          return true;
+        }
+        cur = &e.object;
+      }
+      Expression::ComputedMemberExpression(e) => {
+        if e.optional {
+          return true;
+        }
+        cur = &e.object;
+      }
+      _ => return false,
+    }
   }
 }

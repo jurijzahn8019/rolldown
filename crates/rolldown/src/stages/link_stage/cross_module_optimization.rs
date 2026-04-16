@@ -3,28 +3,24 @@ use oxc::{
   ast::{
     AstBuilder, AstKind,
     ast::{
-      BindingPattern, Declaration, ExportDefaultDeclaration, ExportDefaultDeclarationKind,
-      ExportNamedDeclaration,
+      BindingIdentifier, BindingPattern, Declaration, ExportDefaultDeclaration,
+      ExportDefaultDeclarationKind, ExportNamedDeclaration,
     },
   },
   ast_visit::{Visit, walk},
-  semantic::ScopeFlags,
 };
 use rolldown_common::{
-  AstScopes, ConstExportMeta, EcmaViewMeta, FlatOptions, GetLocalDb, ModuleIdx,
+  AstScopes, ConstExportMeta, EcmaViewMeta, FlatOptions, GetLocalDb, IndexModules, ModuleIdx,
   SharedNormalizedBundlerOptions, SideEffectDetail, StmtInfoIdx, SymbolRef, SymbolRefDb,
   SymbolRefFlags,
 };
-use rolldown_ecmascript_utils::{ExpressionExt, is_top_level};
+use rolldown_ecmascript_utils::ExpressionExt;
 use rolldown_utils::rayon::{IntoParallelRefIterator, ParallelIterator};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{
-  ast_scanner::{
-    const_eval::{ConstEvalCtx, try_extract_const_literal},
-    side_effect_detector::SideEffectDetector,
-  },
-  module_finalizers::TraverseState,
+use crate::ast_scanner::{
+  const_eval::{ConstEvalCtx, try_extract_const_literal},
+  side_effect_detector::SideEffectDetector,
 };
 
 use super::LinkStage;
@@ -50,8 +46,6 @@ impl CrossModuleOptimizationCtx {
 #[derive(Default, Clone, Copy, Debug)]
 struct CrossModuleOptimizationConfig {
   pass: u32,
-  #[expect(unused)]
-  side_effects_free_function_optimization: bool,
   inline_const_optimization: bool,
 }
 
@@ -59,40 +53,17 @@ type ModuleIdxAndStmtIdxToDynamicImportExprAddrMap =
   FxHashMap<ModuleIdx, FxHashMap<StmtInfoIdx, FxHashSet<Address>>>;
 
 impl LinkStage<'_> {
-  fn prepare_cross_module_optimization(&mut self) -> CrossModuleOptimizationConfig {
-    let side_effect_free_function_symbols = self
-      .module_table
-      .iter()
-      .zip(self.symbols.inner().iter())
-      .filter_map(|(m, symbol_for_module)| {
-        let normal_module = m.as_normal()?;
-        let idx = normal_module.idx;
-        normal_module
-          .meta
-          .contains(EcmaViewMeta::TopExportedSideEffectsFreeFunction)
-          .then(move || {
-            let symbol_for_module = symbol_for_module.as_ref()?;
-            Some(symbol_for_module.flags.iter().filter_map(move |(symbol_id, flag)| {
-              flag
-                .contains(SymbolRefFlags::SideEffectsFreeFunction)
-                .then_some(SymbolRef::from((idx, *symbol_id)))
-            }))
-          })
-          .flatten()
-      })
-      .flatten()
-      .collect::<FxHashSet<SymbolRef>>();
-    self.side_effects_free_function_symbol_ref = side_effect_free_function_symbols;
+  fn prepare_cross_module_optimization(&self) -> CrossModuleOptimizationConfig {
+    let has_side_effect_free_functions = self.module_table.iter().any(|m| {
+      m.as_normal()
+        .is_some_and(|n| n.meta.contains(EcmaViewMeta::TopExportedSideEffectsFreeFunction))
+    });
 
     #[expect(clippy::bool_to_int_with_if)]
-    let other_optimization_pass =
-      if self.side_effects_free_function_symbol_ref.is_empty() { 0 } else { 1 };
+    let other_optimization_pass = if has_side_effect_free_functions { 1 } else { 0 };
     let cross_module_inline_const_pass = self.options.optimization.inline_const_pass() - 1;
     CrossModuleOptimizationConfig {
       pass: cross_module_inline_const_pass.max(other_optimization_pass),
-      side_effects_free_function_optimization: !self
-        .side_effects_free_function_symbol_ref
-        .is_empty(),
       inline_const_optimization: cross_module_inline_const_pass >= 1,
     }
   }
@@ -121,7 +92,7 @@ impl LinkStage<'_> {
     // collect all modules that has dynamic import record
     // two dimension map module_idx -> stmt_idx -> dynamic_import_expression_address
     let mut module_idx_and_stmt_idx_to_dynamic_import_expr_addr_map = FxHashMap::default();
-    self.entries.iter().for_each(|entry| {
+    self.entries.values().flatten().for_each(|entry| {
       entry.related_stmt_infos.iter().for_each(
         |(module_idx, stmt_idx, address, _import_record_idx)| {
           module_idx_and_stmt_idx_to_dynamic_import_expr_addr_map
@@ -133,23 +104,51 @@ impl LinkStage<'_> {
         },
       );
     });
+    // Track modules to process in subsequent passes. None means process all modules (first pass).
+    let mut modules_to_process: Option<FxHashSet<ModuleIdx>> = None;
     while ctx.config.pass > 0 && ctx.changed {
       ctx.config.pass -= 1;
       ctx.changed = false;
-      self.run(
+      let new_constant_refs = self.run(
         &mut ctx,
         &mut constant_symbol_map,
         &module_idx_and_stmt_idx_to_dynamic_import_expr_addr_map,
         &mut unreachable_addresses,
+        modules_to_process.as_ref(),
       );
       if !ctx.changed {
         break;
       }
+      modules_to_process = Some(self.find_modules_referencing_constants(&new_constant_refs));
     }
     self.global_constant_symbol_map = constant_symbol_map;
     // Return all unreachable import expression addresses instead of add it as a field of LinkStage,
     // Because this set is only used include statement stage.
     unreachable_addresses
+  }
+
+  /// Find all modules that have imports resolving to any of the given constant canonical refs.
+  fn find_modules_referencing_constants(
+    &self,
+    new_constant_refs: &FxHashSet<SymbolRef>,
+  ) -> FxHashSet<ModuleIdx> {
+    if new_constant_refs.is_empty() {
+      return FxHashSet::default();
+    }
+
+    self
+      .module_table
+      .iter()
+      .filter_map(|module| {
+        let normal_module = module.as_normal()?;
+        // Check if any of the module's named imports resolve to a newly discovered constant
+        let references_new_constant = normal_module.named_imports.keys().any(|local_symbol_ref| {
+          let canonical_ref = self.symbols.canonical_ref_for(*local_symbol_ref);
+          new_constant_refs.contains(&canonical_ref)
+        });
+        references_new_constant.then_some(normal_module.idx)
+      })
+      .collect()
   }
 
   fn run(
@@ -158,11 +157,15 @@ impl LinkStage<'_> {
     constant_symbol_map: &mut FxHashMap<SymbolRef, ConstExportMeta>,
     module_idx_and_stmt_idx_to_dynamic_import_expr_addr_map: &ModuleIdxAndStmtIdxToDynamicImportExprAddrMap,
     all_unreachable_addresses: &mut FxHashSet<Address>,
-  ) {
+    modules_to_process: Option<&FxHashSet<ModuleIdx>>,
+  ) -> FxHashSet<SymbolRef> {
     let mutation_result: Vec<MutationResult> = self
       .sorted_modules
       .par_iter()
       .filter_map(|item| {
+        if modules_to_process.is_some_and(|filter| !filter.contains(item)) {
+          return None;
+        }
         let module = self.module_table[*item].as_normal()?;
         let module_idx = module.idx;
         let ast =
@@ -193,15 +196,13 @@ impl LinkStage<'_> {
           let mut ctx = CrossModuleOptimizationRunnerContext {
             local_constant_symbol_map: FxHashMap::default(),
             side_effect_detail_mutations: FxHashMap::default(),
-            scope_stack: vec![],
-            traverse_state: TraverseState::empty(),
             side_effect_free_call_expr_addr: FxHashSet::default(),
             immutable_ctx: CrossModuleOptimizationImmutableCtx {
               eval_ctx: &eval_ctx,
               export_default_symbol: module.default_export_ref,
               module_idx,
               config: &cross_module_inline_const_ctx.config,
-              global_side_effect_free_function_symbols: &self.side_effects_free_function_symbol_ref,
+              modules: &self.module_table.modules,
               symbols: &self.symbols,
               flat_options: self.flat_options,
               options: self.options,
@@ -236,6 +237,7 @@ impl LinkStage<'_> {
       })
       .collect();
 
+    let mut new_constant_refs = FxHashSet::default();
     for (side_effect_mutations, local_constants, unreachable_addresses) in mutation_result {
       if let Some((module_idx, mutations)) = side_effect_mutations {
         if let Some(module) = self.module_table[module_idx].as_normal_mut() {
@@ -247,12 +249,14 @@ impl LinkStage<'_> {
 
       if !local_constants.is_empty() {
         cross_module_inline_const_ctx.changed = true;
+        new_constant_refs.extend(local_constants.keys().copied());
         constant_symbol_map.extend(local_constants);
       }
 
       // Collect all unreachable import expression addresses
       all_unreachable_addresses.extend(unreachable_addresses);
     }
+    new_constant_refs
   }
 }
 
@@ -261,7 +265,7 @@ struct CrossModuleOptimizationImmutableCtx<'a, 'ast: 'a> {
   export_default_symbol: SymbolRef,
   module_idx: ModuleIdx,
   config: &'a CrossModuleOptimizationConfig,
-  global_side_effect_free_function_symbols: &'a FxHashSet<SymbolRef>,
+  modules: &'a IndexModules,
   symbols: &'a SymbolRefDb,
   flat_options: FlatOptions,
   options: &'a SharedNormalizedBundlerOptions,
@@ -272,8 +276,6 @@ struct CrossModuleOptimizationImmutableCtx<'a, 'ast: 'a> {
 struct CrossModuleOptimizationRunnerContext<'a, 'ast: 'a> {
   local_constant_symbol_map: FxHashMap<SymbolRef, ConstExportMeta>,
   side_effect_detail_mutations: FxHashMap<StmtInfoIdx, SideEffectDetail>,
-  scope_stack: Vec<ScopeFlags>,
-  traverse_state: TraverseState,
   side_effect_free_call_expr_addr: FxHashSet<Address>,
   immutable_ctx: CrossModuleOptimizationImmutableCtx<'a, 'ast>,
   toplevel_stmt_idx: StmtInfoIdx,
@@ -293,20 +295,6 @@ impl<'a, 'ast: 'a> std::ops::Deref for CrossModuleOptimizationRunnerContext<'a, 
 }
 
 impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast> {
-  fn enter_scope(
-    &mut self,
-    flags: oxc::semantic::ScopeFlags,
-    _scope_id: &std::cell::Cell<Option<oxc::semantic::ScopeId>>,
-  ) {
-    self.scope_stack.push(flags);
-    self.traverse_state.set(TraverseState::TopLevel, is_top_level(&self.scope_stack));
-  }
-
-  fn leave_scope(&mut self) {
-    self.scope_stack.pop();
-    self.traverse_state.set(TraverseState::TopLevel, is_top_level(&self.scope_stack));
-  }
-
   fn enter_node(&mut self, kind: AstKind<'ast>) {
     self.visit_path.push(kind);
   }
@@ -316,16 +304,6 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
   }
 
   fn visit_program(&mut self, program: &oxc::ast::ast::Program<'ast>) {
-    self.enter_scope(
-      {
-        let mut flags = ScopeFlags::Top;
-        if program.source_type.is_strict() || program.has_use_strict_directive() {
-          flags |= ScopeFlags::StrictMode;
-        }
-        flags
-      },
-      &program.scope_id,
-    );
     // Custom visit
     for (idx, stmt) in program.body.iter().enumerate() {
       let pre_addr_len = self.side_effect_free_call_expr_addr.len();
@@ -337,14 +315,13 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
           self.immutable_ctx.flat_options,
           self.immutable_ctx.options,
           Some(&self.side_effect_free_call_expr_addr),
+          None,
         )
         .detect_side_effect_of_stmt(stmt);
         self.side_effect_detail_mutations.insert(stmt_info_idx, side_effect_detail);
       }
       self.toplevel_stmt_idx += 1;
     }
-
-    self.leave_scope();
   }
 
   fn visit_import_expression(&mut self, it: &oxc::ast::ast::ImportExpression<'ast>) {
@@ -370,26 +347,38 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
 
   fn visit_call_expression(&mut self, it: &oxc::ast::ast::CallExpression<'ast>) {
     let mut pre_addr = None;
-    if self.traverse_state.contains(TraverseState::TopLevel)
-      || !self.immutable_ctx.stmt_idx_to_dynamic_import_expr_addr.is_empty()
-    {
-      let is_side_effects_free_function = it
-        .callee
-        .as_identifier()
-        .and_then(|item| {
-          let ref_id = item.reference_id.get()?;
-          let symbol_id = self.immutable_ctx.eval_ctx.scope.get_reference(ref_id).symbol_id()?;
+    let (is_side_effects_free_function, is_pure_annotation_only) = it
+      .callee
+      .as_identifier()
+      .and_then(|item| {
+        let ref_id = item.reference_id.get()?;
+        let symbol_id = self.immutable_ctx.eval_ctx.scope.get_reference(ref_id).symbol_id()?;
 
-          let symbol_ref = self
+        let symbol_ref = self
+          .immutable_ctx
+          .symbols
+          .canonical_ref_for((self.immutable_ctx.module_idx, symbol_id).into());
+        let is_free = symbol_ref
+          .is_side_effect_free_function(self.immutable_ctx.symbols, self.immutable_ctx.modules);
+        let is_annotation_only = is_free
+          && self
             .immutable_ctx
             .symbols
-            .canonical_ref_for((self.immutable_ctx.module_idx, symbol_id).into());
-          Some(self.immutable_ctx.global_side_effect_free_function_symbols.contains(&symbol_ref))
-        })
-        .unwrap_or(false);
+            .local_db(symbol_ref.owner)
+            .flags
+            .get(&symbol_ref.symbol)
+            .is_some_and(|f| f.contains(SymbolRefFlags::PureAnnotationOnly));
+        Some((is_free, is_annotation_only))
+      })
+      .unwrap_or((false, false));
 
-      if is_side_effects_free_function {
-        self.side_effect_free_call_expr_addr.insert(it.unstable_address());
+    if is_side_effects_free_function {
+      self.side_effect_free_call_expr_addr.insert(it.unstable_address());
+      // Only track as latest side-effect-free call for unreachable import detection
+      // when the function is truly empty (not just annotated with @__NO_SIDE_EFFECTS__).
+      // Annotated functions may still use their arguments, so dynamic imports in
+      // callback arguments should not be treated as unreachable.
+      if !is_pure_annotation_only {
         pre_addr = self.latest_side_effect_free_call_expr_addr.replace(it.unstable_address());
       }
     }
@@ -450,10 +439,10 @@ impl<'a, 'ast: 'a> Visit<'ast> for CrossModuleOptimizationRunnerContext<'a, 'ast
     let local_binding_for_default_export = match &it.declaration {
       oxc::ast::match_expression!(ExportDefaultDeclarationKind) => None,
       ExportDefaultDeclarationKind::FunctionDeclaration(fn_decl) => {
-        fn_decl.id.as_ref().map(rolldown_ecmascript_utils::BindingIdentifierExt::expect_symbol_id)
+        fn_decl.id.as_ref().map(BindingIdentifier::symbol_id)
       }
       ExportDefaultDeclarationKind::ClassDeclaration(cls_decl) => {
-        cls_decl.id.as_ref().map(rolldown_ecmascript_utils::BindingIdentifierExt::expect_symbol_id)
+        cls_decl.id.as_ref().map(BindingIdentifier::symbol_id)
       }
       ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => unreachable!(),
     };

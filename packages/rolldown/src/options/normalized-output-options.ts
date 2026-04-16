@@ -8,14 +8,20 @@ import type {
   AddonFunction,
   AssetFileNamesFunction,
   ChunkFileNamesFunction,
+  CommentsOptions,
   GlobalsFunction,
   MinifyOptions,
   OutputOptions,
 } from './output-options';
+// oxlint-disable-next-line no-unused-vars -- this is used in JSDoc links
+import type { ModuleFormat } from './output-options';
 
 type PathsFunction = (id: string) => string;
 
-/** @category Plugin APIs */
+/**
+ * A normalized version of {@linkcode ModuleFormat}.
+ * @category Plugin APIs
+ */
 export type InternalModuleFormat = 'es' | 'cjs' | 'iife' | 'umd';
 
 /** @category Plugin APIs */
@@ -40,10 +46,6 @@ export interface NormalizedOutputOptions {
   sourcemap: boolean | 'inline' | 'hidden';
   /** @see {@linkcode OutputOptions.sourcemapBaseUrl | sourcemapBaseUrl} */
   sourcemapBaseUrl: string | undefined;
-  /** @see {@linkcode OutputOptions.cssEntryFileNames | cssEntryFileNames} */
-  cssEntryFileNames: string | ChunkFileNamesFunction;
-  /** @see {@linkcode OutputOptions.cssChunkFileNames | cssChunkFileNames} */
-  cssChunkFileNames: string | ChunkFileNamesFunction;
   /** @see {@linkcode OutputOptions.codeSplitting | codeSplitting} */
   codeSplitting: boolean;
   /** @deprecated Use `codeSplitting` instead. */
@@ -76,14 +78,21 @@ export interface NormalizedOutputOptions {
   hashCharacters: 'base64' | 'base36' | 'hex';
   /** @see {@linkcode OutputOptions.sourcemapDebugIds | sourcemapDebugIds} */
   sourcemapDebugIds: boolean;
+  /** @see {@linkcode OutputOptions.sourcemapExcludeSources | sourcemapExcludeSources} */
+  sourcemapExcludeSources: boolean;
   /** @see {@linkcode OutputOptions.sourcemapIgnoreList | sourcemapIgnoreList} */
   sourcemapIgnoreList: boolean | SourcemapIgnoreListOption | StringOrRegExp | undefined;
   /** @see {@linkcode OutputOptions.sourcemapPathTransform | sourcemapPathTransform} */
   sourcemapPathTransform: SourcemapPathTransformOption | undefined;
   /** @see {@linkcode OutputOptions.minify | minify} */
   minify: false | MinifyOptions | 'dce-only';
-  /** @see {@linkcode OutputOptions.legalComments | legalComments} */
+  /**
+   * @deprecated Use `comments.legal` instead.
+   * @see {@linkcode OutputOptions.legalComments | legalComments}
+   */
   legalComments: 'none' | 'inline';
+  /** @see {@linkcode OutputOptions.comments | comments} */
+  comments: Required<CommentsOptions>;
   /** @see {@linkcode OutputOptions.polyfillRequire | polyfillRequire} */
   polyfillRequire: boolean;
   /** @see {@linkcode OutputOptions.plugins | plugins} */
@@ -150,16 +159,6 @@ export class NormalizedOutputOptionsImpl
   @lazyProp
   get sourcemapBaseUrl(): string | undefined {
     return this.inner.sourcemapBaseUrl ?? undefined;
-  }
-
-  @lazyProp
-  get cssEntryFileNames(): string | ChunkFileNamesFunction {
-    return this.inner.cssEntryFilenames || this.outputOptions.cssEntryFileNames!;
-  }
-
-  @lazyProp
-  get cssChunkFileNames(): string | ChunkFileNamesFunction {
-    return this.inner.cssChunkFilenames || this.outputOptions.cssChunkFileNames!;
   }
 
   @lazyProp
@@ -261,6 +260,11 @@ export class NormalizedOutputOptionsImpl
   }
 
   @lazyProp
+  get sourcemapExcludeSources(): boolean {
+    return this.inner.sourcemapExcludeSources;
+  }
+
+  @lazyProp
   get sourcemapIgnoreList(): boolean | SourcemapIgnoreListOption | StringOrRegExp | undefined {
     return this.outputOptions.sourcemapIgnoreList;
   }
@@ -285,6 +289,16 @@ export class NormalizedOutputOptionsImpl
   @lazyProp
   get legalComments(): 'none' | 'inline' {
     return this.inner.legalComments;
+  }
+
+  @lazyProp
+  get comments(): Required<CommentsOptions> {
+    const c = this.inner.comments;
+    return {
+      legal: c.legal ?? true,
+      annotation: c.annotation ?? true,
+      jsdoc: c.jsdoc ?? true,
+    };
   }
 
   @lazyProp

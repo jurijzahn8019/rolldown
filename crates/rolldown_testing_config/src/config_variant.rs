@@ -1,7 +1,7 @@
 use rolldown_common::{
-  AddonOutputOption, BundlerOptions, CodeSplittingMode, ExperimentalOptions, InlineConstOption,
-  OptimizationOption, OutputExports, OutputFormat, PreserveEntrySignatures, TreeshakeOptions,
-  deserialize_inline_const,
+  AddonOutputOption, BundlerOptions, CodeSplittingMode, CommentsOptions, ExperimentalOptions,
+  InlineConstOption, OptimizationOption, OutputExports, OutputFormat, PreserveEntrySignatures,
+  StrictMode, TreeshakeOptions, deserialize_inline_const,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -16,6 +16,7 @@ pub struct ConfigVariant {
   pub name: Option<String>,
   pub exports: Option<OutputExports>,
   pub strict_execution_order: Option<bool>,
+  pub strict: Option<StrictMode>,
   pub entry_filenames: Option<String>,
   pub inline_dynamic_imports: Option<bool>,
   pub dynamic_import_in_cjs: Option<bool>,
@@ -34,6 +35,7 @@ pub struct ConfigVariant {
   pub footer: Option<String>,
   pub intro: Option<String>,
   pub outro: Option<String>,
+  pub comments: Option<CommentsOptions>,
   pub chunk_optimization: Option<bool>,
   // --- non-bundler options are start with `_`
   /// Whether to include the output in the snapshot for this config variant.
@@ -60,6 +62,9 @@ impl ConfigVariant {
     }
     if let Some(strict_execution_order) = &self.strict_execution_order {
       config.strict_execution_order = Some(*strict_execution_order);
+    }
+    if let Some(strict) = &self.strict {
+      config.strict = Some(*strict);
     }
     if let Some(entry_filenames) = &self.entry_filenames {
       config.entry_filenames = Some(entry_filenames.clone().into());
@@ -123,6 +128,9 @@ impl ConfigVariant {
     if let Some(outro) = &self.outro {
       config.outro = Some(AddonOutputOption::String(Some(outro.clone())));
     }
+    if let Some(comments) = &self.comments {
+      config.comments = Some(*comments);
+    }
     if let Some(chunk_optimization) = &self.chunk_optimization {
       config.experimental = Some(ExperimentalOptions {
         chunk_optimization: Some(*chunk_optimization),
@@ -148,6 +156,9 @@ impl ConfigVariant {
     }
     if let Some(strict_execution_order) = &self.strict_execution_order {
       fields.push(format!("strict_execution_order: {strict_execution_order:?}"));
+    }
+    if let Some(strict) = &self.strict {
+      fields.push(format!("strict: {strict:?}"));
     }
     if let Some(inline_dynamic_imports) = &self.inline_dynamic_imports {
       fields.push(format!("inline_dynamic_imports: {inline_dynamic_imports:?}"));
@@ -184,6 +195,9 @@ impl ConfigVariant {
     }
     if let Some(minify) = &self.minify {
       fields.push(format!("minify: {minify:?}"));
+    }
+    if let Some(comments) = &self.comments {
+      fields.push(format!("comments: {comments}"));
     }
     if let Some(chunk_optimization) = &self.chunk_optimization {
       fields.push(format!("chunk_optimization: {chunk_optimization:?}"));

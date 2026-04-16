@@ -20,7 +20,7 @@ use crate::{SharedResolver, utils::determine_minify_internal_exports_default};
 
 pub struct PrepareBuildContext {
   pub fs: OsFileSystem,
-  pub resolver: SharedResolver,
+  pub resolver: SharedResolver<OsFileSystem>,
   pub options: Arc<NormalizedBundlerOptions>,
   pub warnings: Vec<BuildDiagnostic>,
 }
@@ -163,7 +163,7 @@ pub fn prepare_build_context(
 
   let mut raw_define = raw_options.define.unwrap_or_default();
   if matches!(platform, Platform::Browser) && !raw_define.contains_key("process.env.NODE_ENV") {
-    if raw_minify.is_enabled() {
+    if raw_minify.is_production() {
       raw_define.insert("process.env.NODE_ENV".to_string(), "'production'".to_string());
     } else {
       raw_define.insert("process.env.NODE_ENV".to_string(), "'development'".to_string());
@@ -269,7 +269,8 @@ pub fn prepare_build_context(
   }
 
   let tsconfig = raw_options.tsconfig.map(|tsconfig| tsconfig.with_base(&cwd)).unwrap_or_default();
-  let fs = OsFileSystem::new(raw_resolve.yarn_pnp.is_some_and(|b| b));
+  let yarn_pnp = raw_resolve.yarn_pnp.unwrap_or(false);
+  let fs = OsFileSystem::new(yarn_pnp);
   let resolver = Arc::new(Resolver::new(fs.clone(), cwd.clone(), platform, &tsconfig, raw_resolve));
 
   let transform_options = {
@@ -339,7 +340,7 @@ pub fn prepare_build_context(
           )
         } else {
           TransformOptions::new_raw(
-            RawTransformOptions::new(raw_transform_options, v.clone()),
+            RawTransformOptions::new(raw_transform_options, v.clone(), yarn_pnp),
             target,
             jsx_preset,
           )
@@ -350,7 +351,7 @@ pub fn prepare_build_context(
           // Auto mode: Create Raw mode TransformOptions
           // Each file will find its nearest tsconfig during compilation
           TransformOptions::new_raw(
-            RawTransformOptions::new(raw_transform_options, v),
+            RawTransformOptions::new(raw_transform_options, v, yarn_pnp),
             target,
             jsx_preset,
           )
@@ -378,12 +379,6 @@ pub fn prepare_build_context(
     asset_filenames: raw_options
       .asset_filenames
       .unwrap_or_else(|| "assets/[name]-[hash][extname]".to_string().into()),
-    css_entry_filenames: raw_options
-      .css_entry_filenames
-      .unwrap_or_else(|| "[name].css".to_string().into()),
-    css_chunk_filenames: raw_options
-      .css_chunk_filenames
-      .unwrap_or_else(|| "[name]-[hash].css".to_string().into()),
     sanitize_filename: raw_options.sanitize_filename.unwrap_or_default(),
     banner: raw_options.banner,
     footer: raw_options.footer,
@@ -406,6 +401,7 @@ pub fn prepare_build_context(
     sourcemap_ignore_list: raw_options.sourcemap_ignore_list,
     sourcemap_path_transform: raw_options.sourcemap_path_transform,
     sourcemap_debug_ids: raw_options.sourcemap_debug_ids.unwrap_or(false),
+    sourcemap_exclude_sources: raw_options.sourcemap_exclude_sources.unwrap_or(false),
     shim_missing_exports: raw_options.shim_missing_exports.unwrap_or(false),
     module_types,
     experimental,
@@ -423,6 +419,16 @@ pub fn prepare_build_context(
     checks: raw_options.checks.unwrap_or_default().into(),
     watch: raw_options.watch.unwrap_or_default(),
     legal_comments: raw_options.legal_comments.unwrap_or(LegalComments::Inline),
+    comments: {
+      let mut comments = raw_options.comments.unwrap_or_default();
+      // When `comments` option is not explicitly set, `legalComments` can override `comments.legal`
+      if raw_options.comments.is_none() {
+        if let Some(legal) = raw_options.legal_comments {
+          comments.legal = matches!(legal, LegalComments::Inline);
+        }
+      }
+      comments
+    },
     drop_labels: FxHashSet::from_iter(raw_options.drop_labels.unwrap_or_default()),
     keep_names: raw_options.keep_names.unwrap_or_default(),
     polyfill_require: raw_options.polyfill_require.unwrap_or(true),
@@ -454,6 +460,7 @@ pub fn prepare_build_context(
     clean_dir: raw_options.clean_dir.unwrap_or(false),
     context: raw_options.context.unwrap_or_default(),
     strict_execution_order: raw_options.strict_execution_order.unwrap_or(false),
+    strict: raw_options.strict.unwrap_or_default(),
   };
 
   normalized.minify = raw_minify.normalize(&normalized);

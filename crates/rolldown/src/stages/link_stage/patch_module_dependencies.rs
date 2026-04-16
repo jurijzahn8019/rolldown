@@ -30,7 +30,7 @@ impl LinkStage<'_> {
         module
           .stmt_infos
           .iter_enumerated()
-          .filter(|(idx, _)| meta.stmt_info_included[*idx])
+          .filter(|(idx, _)| meta.stmt_info_included.has_bit(*idx))
           .for_each(|(_, stmt_info)| {
             // We need this step to include the runtime module, if there are symbols of it.
             // TODO: Maybe we should push runtime module to `LinkingMetadata::dependencies` while pushing the runtime symbols.
@@ -116,6 +116,20 @@ impl LinkStage<'_> {
 
       if !runtime_helper.is_empty() {
         meta.dependencies.insert(self.runtime.id());
+      }
+    }
+
+    // If the runtime module has side effects (e.g. from a plugin transform) and is included,
+    // ensure entry modules depend on it so the code splitter can reach it via BFS.
+    let runtime_idx = self.runtime.id();
+    if self.metas[runtime_idx].is_included {
+      if let Some(runtime_module) = self.module_table[runtime_idx].as_normal() {
+        if runtime_module.side_effects.has_side_effects() {
+          for &entry_module_idx in self.entries.keys() {
+            self.metas[entry_module_idx].dependencies.insert(runtime_idx);
+            self.metas[entry_module_idx].has_side_effectful_runtime_dep = true;
+          }
+        }
       }
     }
   }

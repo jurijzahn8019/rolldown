@@ -1,11 +1,11 @@
 use indexmap::map::Entry;
-use oxc::span::CompactStr;
 use oxc::{
   allocator::TakeIn,
   ast::ast::{self, Expression},
   semantic::{SemanticBuilder, Stats},
   span::SPAN,
 };
+use oxc_str::CompactStr;
 use rolldown_common::{
   EcmaModuleAstUsage, ExportsKind, GetLocalDbMut, LocalExport, Module, ModuleIdx, ModuleType,
   NormalModule, StmtInfo, StmtInfoIdx, SymbolOrMemberExprRef, SymbolRef, SymbolRefDbForModule,
@@ -164,7 +164,7 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
             &mut property.value,
             snippet
               .builder
-              .expression_identifier(SPAN, snippet.builder.atom(legitimized_ident.as_str())),
+              .expression_identifier(SPAN, snippet.builder.str(legitimized_ident.as_str())),
           );
           // TODO(shulaoda): Waiting for oxc transform to support the ES feature `ShorthandProperties`.
           if key == "__proto__" {
@@ -174,7 +174,7 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
             property.key = ast::PropertyKey::StaticIdentifier(
               snippet
                 .builder
-                .alloc_identifier_name(SPAN, snippet.builder.atom(legitimized_ident.as_ref())),
+                .alloc_identifier_name(SPAN, snippet.builder.str(legitimized_ident.as_ref())),
             );
           }
           match index_map.entry(legitimized_ident) {
@@ -211,11 +211,10 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
     return false;
   }
   let original_symbol_ref_db = std::mem::take(link_staged.symbols.local_db_mut(module_idx));
-  let (_, facade_scope) = original_symbol_ref_db.ast_scopes.into_inner();
   // recreate semantic data
   #[expect(clippy::cast_possible_truncation)]
   let scoping = ecma_ast.make_symbol_table_and_scope_tree_with_semantic_builder(
-    SemanticBuilder::new().with_scope_tree_child_ids(true).with_stats(Stats {
+    SemanticBuilder::new().with_stats(Stats {
       nodes: declaration_binding_names.len().next_power_of_two() as u32,
       scopes: 1,
       symbols: declaration_binding_names.len() as u32,
@@ -226,8 +225,17 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
   // update semantic data of module
   let root_scope_id = scoping.root_scope_id();
   let mut symbol_ref_db = SymbolRefDbForModule::new(scoping, module_idx, root_scope_id);
-  symbol_ref_db.set_facade_scope(facade_scope);
-
+  // Re-create facade symbols in the new scoping. The JSON module was re-parsed above,
+  // producing a new Scoping with fresh symbol IDs, so old facade IDs are invalid.
+  // We allocate new IDs by name and update the module's references.
+  let mut recreate_facade = |old_ref: SymbolRef| -> SymbolRef {
+    symbol_ref_db.create_facade_root_symbol_ref(original_symbol_ref_db.symbol_name(old_ref.symbol))
+  };
+  module.namespace_object_ref = recreate_facade(module.namespace_object_ref);
+  module.default_export_ref = recreate_facade(module.default_export_ref);
+  if let Some(hot_ref) = module.hmr_hot_ref {
+    module.hmr_hot_ref = Some(recreate_facade(hot_ref));
+  }
   let namespace_object_ref = module.namespace_object_ref;
   let default_export_ref = module.default_export_ref;
 
@@ -239,7 +247,7 @@ fn json_object_expr_to_esm(link_staged: &mut LinkStage, module_idx: ModuleIdx) -
     stmt_info.flat_map(|info| info.referenced_symbols).collect::<Vec<_>>();
   for (local, (exported, _)) in &declaration_binding_names {
     let symbol_id =
-      symbol_ref_db.scoping().get_root_binding(local.as_str()).expect("should have binding");
+      symbol_ref_db.scoping().get_root_binding(local.as_str().into()).expect("should have binding");
     let symbol_ref: SymbolRef = (module_idx, symbol_id).into();
     all_declared_symbols.push(SymbolOrMemberExprRef::from(symbol_ref));
     let stmt_info =

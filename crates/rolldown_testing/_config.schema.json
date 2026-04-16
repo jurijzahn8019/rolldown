@@ -22,6 +22,14 @@
       "type": "boolean",
       "default": false
     },
+    "expectWarning": {
+      "description": "If `true`, the fixture are expected to produce warnings. If `false`, the fixture are expected\nto produce no warnings. If not set, no assertion is made on warnings.",
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "default": null
+    },
     "_comment": {
       "description": "A workaround for writing comments in JSON.",
       "type": "string",
@@ -141,18 +149,6 @@
           ]
         },
         "chunkFilenames": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "cssEntryFilenames": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "cssChunkFilenames": {
           "type": [
             "string",
             "null"
@@ -317,6 +313,12 @@
             "null"
           ]
         },
+        "sourcemapExcludeSources": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "moduleTypes": {
           "description": "Key is the file extension. The extension should start with a `.`. E.g. `\".txt\"`.",
           "type": [
@@ -458,6 +460,16 @@
             }
           ]
         },
+        "comments": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommentsOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "polyfillRequire": {
           "type": [
             "boolean",
@@ -571,6 +583,16 @@
             "boolean",
             "null"
           ]
+        },
+        "strict": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StrictMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -629,29 +651,12 @@
     "GeneratedCodeOptions": {
       "type": "object",
       "properties": {
-        "preset": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/GeneratedCodePreset"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "symbols": {
           "type": "boolean"
         }
       },
       "required": [
         "symbols"
-      ]
-    },
-    "GeneratedCodePreset": {
-      "type": "string",
-      "enum": [
-        "es5",
-        "es2015"
       ]
     },
     "SourceMapType": {
@@ -706,7 +711,8 @@
             "binary",
             "empty",
             "css",
-            "asset"
+            "asset",
+            "copy"
           ]
         },
         {
@@ -1015,16 +1021,6 @@
             "null"
           ]
         },
-        "transformHiresSourcemap": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/SourcemapHires"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "nativeMagicString": {
           "type": [
             "boolean",
@@ -1114,28 +1110,6 @@
       "enum": [
         "execOrder",
         "moduleId"
-      ]
-    },
-    "SourcemapHires": {
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "boundary"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "boolean": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "boolean"
-          ],
-          "additionalProperties": false
-        }
       ]
     },
     "SimpleMinifyOptions": {
@@ -1323,11 +1297,42 @@
             "null"
           ],
           "format": "double"
+        },
+        "entriesAware": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "entriesAwareMergeThreshold": {
+          "description": "Only effective when `entriesAware` is set to `true`.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "tags": {
+          "description": "Filter modules by tags. Only modules with all specified tags are captured.\nSee meta/design/module-tags.md",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/BuiltinModuleTag"
+          }
         }
       },
       "additionalProperties": false,
       "required": [
         "name"
+      ]
+    },
+    "BuiltinModuleTag": {
+      "description": "Schema-only enum for built-in module tags. Used by `schemars` to generate\na restricted JSON Schema for the `tags` field. Not used at runtime.",
+      "type": "string",
+      "enum": [
+        "$initial"
       ]
     },
     "ChecksOptions": {
@@ -1434,6 +1439,24 @@
             "boolean",
             "null"
           ]
+        },
+        "duplicateShebang": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "unsupportedTsconfigOption": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "ineffectiveDynamicImport": {
+          "type": [
+            "boolean",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -1450,6 +1473,39 @@
             "null"
           ],
           "format": "uint32",
+          "minimum": 0
+        },
+        "usePolling": {
+          "type": "boolean"
+        },
+        "pollInterval": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "compareContentsForPolling": {
+          "type": "boolean"
+        },
+        "useDebounce": {
+          "type": "boolean"
+        },
+        "debounceDelay": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "debounceTickRate": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
           "minimum": 0
         },
         "include": {
@@ -1473,7 +1529,10 @@
       },
       "additionalProperties": false,
       "required": [
-        "skipWrite"
+        "skipWrite",
+        "usePolling",
+        "compareContentsForPolling",
+        "useDebounce"
       ]
     },
     "LegalComments": {
@@ -1489,6 +1548,41 @@
           "const": "inline"
         }
       ]
+    },
+    "CommentsOptions": {
+      "description": "Resolved comments options with explicit boolean flags.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/RawCommentsObject"
+        }
+      ]
+    },
+    "RawCommentsObject": {
+      "type": "object",
+      "properties": {
+        "legal": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "annotation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "jsdoc": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "MakeAbsoluteExternalsRelative": {
       "oneOf": [
@@ -1615,6 +1709,26 @@
         }
       ]
     },
+    "StrictMode": {
+      "description": "Controls whether `\"use strict\"` is emitted in the output.\n\nSee [`rollupjs.org/configuration-options/#output-strict`](https://rollupjs.org/configuration-options/#output-strict).",
+      "oneOf": [
+        {
+          "description": "Respect the `\"use strict\"` directives from the source code.\nThis is the default behavior.",
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "description": "Always emit `\"use strict\"` at the top of the output (not applicable for ESM format).",
+          "type": "string",
+          "const": "always"
+        },
+        {
+          "description": "Never emit `\"use strict\"` in the output.",
+          "type": "string",
+          "const": "never"
+        }
+      ]
+    },
     "ConfigVariant": {
       "type": "object",
       "properties": {
@@ -1655,6 +1769,16 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "strict": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StrictMode"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "entryFilenames": {
@@ -1771,6 +1895,16 @@
             "null"
           ]
         },
+        "comments": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CommentsOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "chunkOptimization": {
           "type": [
             "boolean",
@@ -1794,6 +1928,19 @@
       "additionalProperties": false
     },
     "ExtendedTests": {
+      "description": "Controls which extended test variants are generated.\nCan be `false` to disable all, `true` to enable all (default), or an object to control each individually.",
+      "anyOf": [
+        {
+          "description": "`false` disables all extended tests, `true` enables all (default).",
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/$defs/ExtendedTestsConfig"
+        }
+      ]
+    },
+    "ExtendedTestsConfig": {
+      "description": "Inner struct for deserializing the object form and generating JSON Schema.",
       "type": "object",
       "properties": {
         "oppositeMinifyInternalExports": {

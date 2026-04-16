@@ -4,17 +4,47 @@ mod source_joiner;
 use std::sync::Arc;
 
 use oxc_sourcemap::Token;
-use rustc_hash::FxHashMap;
 
 pub use oxc_sourcemap::{JSONSourceMap, SourceMap, SourceMapBuilder, SourcemapVisualizer};
 pub use source_joiner::SourceJoiner;
 
 pub use crate::source::{Source, SourceMapSource};
 
-use rolldown_utils::rustc_hash::FxHashMapExt;
+/// Strips the first `lines` destination lines from the sourcemap, decrementing all remaining
+/// destination line numbers accordingly. Used to re-anchor a sourcemap after removing a
+/// prefix (e.g. a shebang line) from the generated code.
+pub fn adjust_sourcemap_dst_lines(sourcemap: SourceMap, lines: u32) -> SourceMap {
+  if lines == 0 {
+    return sourcemap;
+  }
+
+  let tokens: Box<[Token]> = sourcemap
+    .get_tokens()
+    .filter(|t| t.get_dst_line() >= lines)
+    .map(|token| {
+      Token::new(
+        token.get_dst_line() - lines,
+        token.get_dst_col(),
+        token.get_src_line(),
+        token.get_src_col(),
+        token.get_source_id(),
+        token.get_name_id(),
+      )
+    })
+    .collect();
+
+  SourceMap::new(
+    sourcemap.get_file().cloned(),
+    sourcemap.get_names().cloned().collect(),
+    sourcemap.get_source_root().map(str::to_owned),
+    sourcemap.get_sources().cloned().collect(),
+    sourcemap.get_source_contents().map(|c| c.map(Arc::clone)).collect(),
+    tokens,
+    None,
+  )
+}
 
 // <https://github.com/rollup/rollup/blob/master/src/utils/collapseSourcemaps.ts>
-#[expect(clippy::cast_possible_truncation)]
 pub fn collapse_sourcemaps(sourcemap_chain: &[&SourceMap]) -> SourceMap {
   debug_assert!(sourcemap_chain.len() > 1);
   if sourcemap_chain.len() == 1 {
@@ -26,61 +56,44 @@ pub fn collapse_sourcemaps(sourcemap_chain: &[&SourceMap]) -> SourceMap {
   let first_map = sourcemap_chain.first().expect("sourcemap_chain should not be empty");
   let chain_without_last = &sourcemap_chain[..sourcemap_chain.len() - 1];
 
-  let sourcemap_and_lookup_table = chain_without_last
+  // Pre-compute lookup tables in reverse order so we avoid reversing on every token lookup.
+  let sourcemap_and_lookup_table: Vec<_> = chain_without_last
     .iter()
-    .map(|sourcemap| (sourcemap, sourcemap.generate_lookup_table()))
-    .collect::<Vec<_>>();
+    .rev()
+    .map(|sourcemap| (*sourcemap, sourcemap.generate_lookup_table()))
+    .collect();
 
-  let source_view_tokens = last_map.get_source_view_tokens();
-
-  let sources_map = first_map
-    .get_sources()
-    .enumerate()
-    .map(|(i, source)| (source, i as u32))
-    .collect::<FxHashMap<_, _>>();
-
-  // Avoid hashing the source text for every token.
-  let mut sources_cache = FxHashMap::with_capacity(sources_map.len());
-
-  let tokens = source_view_tokens
+  let tokens: Box<[Token]> = last_map
+    .get_source_view_tokens()
     .filter_map(|token| {
-      let original_token = sourcemap_and_lookup_table.iter().rev().try_fold(
-        token,
-        |token, (sourcemap, lookup_table)| {
+      let original_token =
+        sourcemap_and_lookup_table.iter().try_fold(token, |token, (sourcemap, lookup_table)| {
           sourcemap.lookup_source_view_token(
             lookup_table,
             token.get_src_line(),
             token.get_src_col(),
           )
-        },
-      );
+        });
       original_token.map(|original_token| {
         Token::new(
           token.get_dst_line(),
           token.get_dst_col(),
           original_token.get_src_line(),
           original_token.get_src_col(),
-          original_token.get_source_id().and_then(|source_id| {
-            sources_cache
-              .entry(source_id)
-              .or_insert_with(|| {
-                first_map.get_source(source_id).and_then(|source| sources_map.get(source))
-              })
-              .copied()
-          }),
+          original_token.get_source_id(),
           original_token.get_name_id(),
         )
       })
     })
-    .collect::<Vec<_>>();
+    .collect();
 
   SourceMap::new(
     None,
-    first_map.get_names().map(Arc::clone).collect::<Vec<_>>(),
+    first_map.get_names().cloned().collect(),
     None,
-    first_map.get_sources().map(Arc::clone).collect::<Vec<_>>(),
-    first_map.get_source_contents().map(|x| x.map(Arc::clone)).collect::<Vec<_>>(),
-    tokens.into_boxed_slice(),
+    first_map.get_sources().cloned().collect(),
+    first_map.get_source_contents().map(|x| x.map(Arc::clone)).collect(),
+    tokens,
     None,
   )
 }
@@ -161,5 +174,69 @@ fn test_collapse_sourcemaps() {
 (0:27) "bar)" --> (3:12) "bar)"
 (0:31) ";\n" --> (3:16) ";\n"
 "#
+  );
+}
+
+/// Test for https://github.com/rollup/rollup/issues/5955
+#[test]
+fn test_collapse_sourcemaps_with_coarse_segments() {
+  use oxc_sourcemap::SourceMap;
+
+  fn get_loc(mut pos: usize, code: &str) -> (u32, u32) {
+    for (line_idx, line) in code.lines().enumerate() {
+      if pos <= line.len() {
+        #[expect(clippy::cast_possible_truncation)]
+        return (line_idx as u32, pos as u32);
+      }
+      pos -= line.len() + 1; // +1 for newline
+    }
+    panic!("position out of bounds");
+  }
+
+  let original_code = "import { useEffect } from 'react';
+
+export function App() {
+  useEffect(() => {
+    console.log('ReplayAnalyze');
+  }, []);
+
+  return <div>{'.'}</div>;
+}
+";
+  let transformed_code = r#"import{jsx}from"react/jsx-runtime";import{useEffect}from"react";export function App(){return useEffect((()=>{console.log("ReplayAnalyze")}),[]),jsx("div",{children:"."})}"#;
+
+  // spellchecker:off
+  let esbuild_map_json = r#"{
+    "version": 3,
+    "sources": ["<stdin>"],
+    "sourcesContent": ["import { useEffect } from 'react';\n\nexport function App() {\n  useEffect(() => {\n    console.log('ReplayAnalyze');\n  }, []);\n\n  return <div>{'.'}</div>;\n}\n"],
+    "mappings": "AAOS;AAPT,SAAS,iBAAiB;AAEnB,gBAAS,MAAM;AACpB,YAAU,MAAM;AACd,YAAQ,IAAI,eAAe;AAAA,EAC7B,GAAG,CAAC,CAAC;AAEL,SAAO,oBAAC,SAAK,eAAI;AACnB;",
+    "names": []
+  }"#;
+  // spellchecker:on
+  let esbuild_map = SourceMap::from_json_string(esbuild_map_json).unwrap();
+
+  // spellchecker:off
+  let terser_map_json = r#"{
+    "version": 3,
+    "names": ["jsx", "useEffect", "App", "console", "log", "children"],
+    "sources": ["0"],
+    "sourcesContent": ["import { jsx } from \"react/jsx-runtime\";\nimport { useEffect } from \"react\";\nexport function App() {\n  useEffect(() => {\n    console.log(\"ReplayAnalyze\");\n  }, []);\n  return /* @__PURE__ */ jsx(\"div\", { children: \".\" });\n}\n"],
+    "mappings": "OAASA,QAAW,2BACXC,cAAiB,eACnB,SAASC,MAId,OAHAD,WAAU,KACRE,QAAQC,IAAI,gBAAgB,GAC3B,IACoBJ,IAAI,MAAO,CAAEK,SAAU,KAChD"
+  }"#;
+  // spellchecker:on
+  let terser_map = SourceMap::from_json_string(terser_map_json).unwrap();
+
+  let collapsed = collapse_sourcemaps(&[&esbuild_map, &terser_map]);
+  let collapsed_lookup_table = collapsed.generate_lookup_table();
+
+  let generated_loc = get_loc(transformed_code.find("return").unwrap(), transformed_code);
+  let original_loc = collapsed
+    .lookup_source_view_token(&collapsed_lookup_table, generated_loc.0, generated_loc.1)
+    .map(|token| (token.get_src_line(), token.get_src_col()));
+  assert_eq!(
+    original_loc,
+    Some(get_loc(original_code.find("return").unwrap(), original_code)),
+    "collapsed sourcemap should map 'return' in transformed code back to original source"
   );
 }

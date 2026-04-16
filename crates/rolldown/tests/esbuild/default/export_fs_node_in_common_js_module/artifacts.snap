@@ -36,15 +36,13 @@ source: crates/rolldown_testing/src/integration_test.rs
 ```js
 import * as fs from "fs";
 import { readFileSync } from "fs";
-
-// HIDDEN [rolldown:runtime]
+// HIDDEN [\0rolldown/runtime.js]
 //#region entry.js
 var require_entry = /* @__PURE__ */ __commonJSMin(((exports) => {
 	exports.fs = fs;
 	exports.readFileSync = readFileSync;
 	exports.foo = 123;
 }));
-
 //#endregion
 export default require_entry();
 

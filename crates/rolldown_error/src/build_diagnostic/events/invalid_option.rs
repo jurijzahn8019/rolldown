@@ -19,6 +19,8 @@ pub enum InvalidOptionType {
   CodeSplittingDisabledWithManualCodeSplitting,
   HashLengthTooLong { pattern_name: String, received: usize, max: usize },
   HashLengthTooShort { pattern_name: String, received: usize, min: usize, chunk_count: u32 },
+  InvalidEmittedFileName(String),
+  NulByteInFilename { pattern_name: String },
 }
 
 #[derive(Debug)]
@@ -99,6 +101,12 @@ impl BuildEvent for InvalidOption {
         }
         InvalidOptionType::HashLengthTooShort { pattern_name, received, min, chunk_count } => {
           format!("To generate hashes for this number of chunks (currently {chunk_count}), you need a minimum hash size of {min}, received {received}. Check the `{pattern_name}` option.")
+        }
+        InvalidOptionType::InvalidEmittedFileName(name) => {
+          format!("The \"fileName\" or \"name\" properties of emitted chunks and assets must be strings that are neither absolute nor relative paths, received \"{name}\".")
+        }
+        InvalidOptionType::NulByteInFilename { pattern_name } => {
+          format!("The \"{pattern_name}\" pattern (or the value returned from the function) would result in a filename with invalid null byte(s) (\\0). This is usually caused by using virtual module IDs (which start with \\0) directly in filenames. Use the module ID without the \\0 prefix, or filter out virtual modules from chunk.moduleIds.")
         }
     }
   }

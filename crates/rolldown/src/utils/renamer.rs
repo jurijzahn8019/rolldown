@@ -1,10 +1,10 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use std::collections::hash_map::Entry;
 
 use oxc::semantic::Scoping;
-use oxc::span::CompactStr;
 use oxc::syntax::keyword::{GLOBAL_OBJECTS, RESERVED_KEYWORDS};
+use oxc_str::CompactStr;
 
 use rolldown_common::{
   ModuleIdx, NormalModule, OutputFormat, SymbolRef, SymbolRefDb, SymbolRefDbForModule,
@@ -151,14 +151,6 @@ impl<'name> Renamer<'name> {
         // handled by reference-based renaming of nested bindings later
         return true;
       }
-
-      // For facade symbols (e.g., external module namespaces), check entry module's nested
-      // scopes to avoid shadowing. Internal modules use reference-based renaming instead.
-      if self.symbol_db.is_facade_symbol(symbol_ref)
-        && self.has_nested_scope_binding(entry_idx, candidate_name)
-      {
-        return false;
-      }
     }
 
     // Renamed candidates must not conflict with own module's nested bindings
@@ -176,7 +168,7 @@ impl<'name> Renamer<'name> {
     let canonical_ref = symbol_ref.canonical_ref(self.symbol_db);
     let canonical_name = canonical_ref.name(self.symbol_db);
 
-    let original_name = if self.symbol_db.is_jsx_preserve
+    let original_name = if self.symbol_db.has_module_preserve_jsx()
       && canonical_ref
         .flags(self.symbol_db)
         .is_some_and(|flags| flags.contains(SymbolRefFlags::MustStartWithCapitalLetterForJSX))
@@ -265,16 +257,27 @@ impl<'name> Renamer<'name> {
     }
 
     // Find unique name: skip candidates that conflict with top-level symbols
+    // or with existing bindings in nested scopes of the same module.
     for count in 1u32.. {
       let name: CompactStr =
         concat_string!(original_name, "$", itoa::Buffer::new().format(count)).into();
 
-      if let Entry::Vacant(entry) = self.used_canonical_names.entry(name) {
-        let candidate_name = entry.key().clone();
-        entry.insert(0);
-        self.canonical_names.insert(symbol_ref, candidate_name);
-        return;
+      if self.used_canonical_names.contains_key(&name) {
+        continue;
       }
+
+      // Also skip if the candidate name conflicts with an existing binding in
+      // a nested scope of the same module. Without this check, renaming `child`
+      // to `child$1` could collide with an existing `child$1` binding in the
+      // same scope (e.g. from Gleam's variable shadowing convention).
+      if self.has_nested_scope_binding(symbol_ref.owner, &name) {
+        self.used_canonical_names.insert(name, 0);
+        continue;
+      }
+
+      self.used_canonical_names.insert(name.clone(), 0);
+      self.canonical_names.insert(symbol_ref, name);
+      return;
     }
   }
 
@@ -342,7 +345,7 @@ impl NestedScopeRenamer<'_, '_> {
       };
 
       for scope_id in self.scoping.scope_ancestors(current_reference.scope_id()) {
-        if let Some(binding) = self.scoping.get_binding(scope_id, &canonical_name)
+        if let Some(binding) = self.scoping.get_binding(scope_id, canonical_name.as_str().into())
           && binding != symbol
         {
           let symbol_ref = (self.module_idx, binding).into();
@@ -394,7 +397,7 @@ impl NestedScopeRenamer<'_, '_> {
 
       for reference in self.scoping.get_resolved_references(symbol_ref.symbol) {
         for scope_id in self.scoping.scope_ancestors(reference.scope_id()) {
-          if let Some(binding) = self.scoping.get_binding(scope_id, &canonical_name)
+          if let Some(binding) = self.scoping.get_binding(scope_id, canonical_name.as_str().into())
             && binding != symbol_ref.symbol
           {
             let nested_symbol_ref = (self.module_idx, binding).into();
@@ -433,23 +436,68 @@ impl NestedScopeRenamer<'_, '_> {
   ///   module.exports = helper;
   /// });
   /// ```
-  pub fn rename_bindings_shadowing_cjs_params(&mut self) {
+  /// Rename nested bindings that would shadow wrapper/factory parameters.
+  ///
+  /// This handles two cases:
+  /// 1. CJS wrapper params ("exports", "module") for CJS-wrapped modules
+  /// 2. External module factory params for IIFE/UMD/CJS formats
+  ///
+  /// # Example (external module)
+  ///
+  /// ```js
+  /// // entry.js
+  /// import Quill from 'quill';
+  /// export class Editor {
+  ///   constructor(quill) {     // Would shadow factory param 'quill'
+  ///     console.log(Quill);    // After bundling: quill.default (shadowed!)
+  ///   }
+  /// }
+  /// ```
+  ///
+  /// Output (fixed):
+  /// ```js
+  /// (function(exports, quill) {
+  ///   class Editor {
+  ///     constructor(quill$1) {   // Renamed to avoid shadowing
+  ///       console.log(quill.default);  // Correctly references factory param
+  ///     }
+  ///   }
+  /// })
+  /// ```
+  pub fn rename_bindings_shadowing_wrapper_params(&mut self, has_factory_params: bool) {
     /// CJS wrapper parameter names that nested scopes should avoid shadowing.
     const CJS_WRAPPER_NAMES: [&str; 2] = ["exports", "module"];
 
     let is_cjs_wrapped =
       matches!(self.link_output.metas[self.module_idx].wrap_kind(), WrapKind::Cjs);
 
-    if !is_cjs_wrapped {
+    // Collect all wrapper/factory param names to check against
+    let mut wrapper_param_names: FxHashSet<CompactStr> = FxHashSet::default();
+
+    // Add CJS wrapper names if module is CJS wrapped
+    if is_cjs_wrapped {
+      wrapper_param_names.extend(CJS_WRAPPER_NAMES.iter().map(|s| CompactStr::new(s)));
+    }
+
+    // Add external module factory param names
+    if has_factory_params {
+      wrapper_param_names.extend(self.module.import_records.iter().filter_map(|rec| {
+        let resolved_module = rec.resolved_module?;
+        let external_module = self.link_output.module_table[resolved_module].as_external()?;
+        self.renamer.get_canonical_name(external_module.namespace_ref).cloned()
+      }));
+    }
+
+    if wrapper_param_names.is_empty() {
       return;
     }
 
     // Skip root scope (index 0), check nested scopes only
     for (_, bindings) in self.scoping.iter_bindings().skip(1) {
       for (&name, symbol_id) in bindings {
-        if CJS_WRAPPER_NAMES.contains(&name) {
+        if wrapper_param_names.contains(name.into()) {
           let symbol_ref = (self.module_idx, *symbol_id).into();
-          self.renamer.register_nested_scope_symbols(symbol_ref, name);
+          self.renamer.register_nested_scope_symbols(symbol_ref, name.as_str());
         }
       }
     }

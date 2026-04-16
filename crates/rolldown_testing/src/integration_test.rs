@@ -114,7 +114,7 @@ impl IntegrationTest {
     for output in &bundle_output.assets {
       if let Output::Chunk(chunk) = output {
         let allocator = oxc::allocator::Allocator::default();
-        let ret = Parser::new(&allocator, &chunk.code, source_type)
+        let ret = Parser::new(&allocator, &chunk.code, source_type.with_jsx(true))
           .with_options(ParseOptions { allow_return_outside_function: true, ..Default::default() })
           .parse();
 
@@ -133,6 +133,7 @@ impl IntegrationTest {
   }
 
   /// Run multiple bundler configurations in HMR mode
+  #[expect(clippy::too_many_lines)]
   async fn run_multiple_for_dev(
     &self,
     multiple_options: Vec<NamedBundlerOptions>,
@@ -234,7 +235,7 @@ impl IntegrationTest {
       // Run initial build (step 0)
       build_results_by_steps.lock().unwrap().push(vec![]);
       dev_engine.run().await.unwrap();
-      dev_engine.create_client_for_testing();
+      dev_engine.create_client_for_testing().await;
 
       // Process HMR steps
       for hmr_edit_files in hmr_steps {
@@ -298,6 +299,20 @@ impl IntegrationTest {
             !self.test_meta.expect_error,
             "Expected the bundling to be failed with diagnosable errors, but got success"
           );
+          if let Some(expect_warning) = self.test_meta.expect_warning {
+            if expect_warning {
+              assert!(
+                !output.warnings.is_empty(),
+                "Expected the bundling to produce warnings, but got none"
+              );
+            } else {
+              assert!(
+                output.warnings.is_empty(),
+                "Expected the bundling to produce no warnings, but got: {:#?}",
+                output.warnings
+              );
+            }
+          }
 
           // Process HMR updates and patches for execution
           let mut patch_chunks: Vec<String> = vec![];
@@ -324,20 +339,33 @@ impl IntegrationTest {
 
           // Execute output if needed
           let bundler_options = dev_engine.bundler_options().await;
+          let config_name = named_options
+            .config_name
+            .as_deref()
+            .map(Some)
+            .unwrap_or(self.test_meta.config_name.as_deref());
           if self.should_execute_output() {
             Self::execute_output_assets(
               &bundler_options,
               &debug_title,
               &patch_chunks,
-              named_options
-                .config_name
-                .as_deref()
-                .map(Some)
-                .unwrap_or(self.test_meta.config_name.as_deref()),
+              config_name,
+              true,
             );
-          } else if !self.test_meta.skip_syntax_validation {
-            // When not executing output, validate that all JS chunks are syntactically valid
-            Self::validate_output_chunks_syntax(output, &bundler_options);
+          } else {
+            if self.test_meta.write_to_disk {
+              Self::execute_output_assets(
+                &bundler_options,
+                &debug_title,
+                &patch_chunks,
+                config_name,
+                false,
+              );
+            }
+            if !self.test_meta.skip_syntax_validation {
+              // When not executing output, validate that all JS chunks are syntactically valid
+              Self::validate_output_chunks_syntax(output, &bundler_options);
+            }
           }
         }
         Err(errs) => {
@@ -350,7 +378,14 @@ impl IntegrationTest {
 
       build_snapshot.initial_output = Some(initial_build_output);
       artifacts_snapshot.builds.push(build_snapshot);
-      drop(dev_engine);
+      // Explicitly close the dev engine to shut down the background coordinator task.
+      // Without this, the coordinator task would persist across tests under the shared runtime.
+      if let Err(err) = dev_engine.close().await {
+        panic!(
+          "Failed to close dev_engine for integration test in `{}` (title: `{debug_title}`): {err:#?}",
+          test_folder_path.display()
+        );
+      }
     }
 
     artifacts_snapshot
@@ -414,20 +449,35 @@ impl IntegrationTest {
             !self.test_meta.expect_error,
             "Expected the bundling to be failed with diagnosable errors, but got success"
           );
+          if let Some(expect_warning) = self.test_meta.expect_warning {
+            if expect_warning {
+              assert!(
+                !output.warnings.is_empty(),
+                "Expected the bundling to produce warnings, but got none"
+              );
+            } else {
+              assert!(
+                output.warnings.is_empty(),
+                "Expected the bundling to produce no warnings, but got: {:#?}",
+                output.warnings
+              );
+            }
+          }
+          let config_name = named_options
+            .config_name
+            .as_deref()
+            .map(Some)
+            .unwrap_or(self.test_meta.config_name.as_deref());
           if self.should_execute_output() {
-            Self::execute_output_assets(
-              bundler.options(),
-              &debug_title,
-              &[],
-              named_options
-                .config_name
-                .as_deref()
-                .map(Some)
-                .unwrap_or(self.test_meta.config_name.as_deref()),
-            );
-          } else if !self.test_meta.skip_syntax_validation {
-            // When not executing output, validate that all JS chunks are syntactically valid
-            Self::validate_output_chunks_syntax(output, bundler.options());
+            Self::execute_output_assets(bundler.options(), &debug_title, &[], config_name, true);
+          } else {
+            if self.test_meta.write_to_disk {
+              Self::execute_output_assets(bundler.options(), &debug_title, &[], config_name, false);
+            }
+            if !self.test_meta.skip_syntax_validation {
+              // When not executing output, validate that all JS chunks are syntactically valid
+              Self::validate_output_chunks_syntax(output, bundler.options());
+            }
           }
         }
         Err(errs) => {
@@ -554,6 +604,7 @@ impl IntegrationTest {
     test_title: &str,
     patch_chunks: &[String],
     config_name: Option<&str>,
+    execute_compiled_entries: bool,
   ) {
     let cwd = options.cwd.clone();
     let dist_folder = cwd.join(&options.out_dir);
@@ -597,6 +648,8 @@ impl IntegrationTest {
 
     if test_script.exists() {
       node_command.arg(test_script);
+    } else if !execute_compiled_entries {
+      return;
     } else {
       // make sure to set this: https://github.com/nodejs/node/issues/59374
       node_command.arg("--input-type=module");

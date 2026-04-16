@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
-use oxc::span::CompactStr;
+use oxc_str::CompactStr;
 use rolldown_common::{
   Chunk, ChunkKind, ExportsKind, IndexModules, ModuleIdx, NormalizedBundlerOptions, OutputExports,
   OutputFormat, Platform, SymbolRef, SymbolRefDb, WrapKind,
@@ -368,8 +368,7 @@ fn must_keep_live_binding(
 ) -> bool {
   let canonical_ref = symbol_db.canonical_ref_for(export_ref);
 
-  if canonical_ref.is_declared_by_const(symbol_db).unwrap_or(false) {
-    // For unknown case, we consider it as not declared by `const`.
+  if canonical_ref.is_declared_by_const(symbol_db) {
     return false;
   }
 

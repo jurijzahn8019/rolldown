@@ -40,7 +40,9 @@ fn init_entry_point_stmt_info(
           dynamic_import_exports_usage_map,
           true,
         )
-        .map(|(_, resolved_export)| (resolved_export.symbol_ref, resolved_export.came_from_cjs)),
+        .map(|(_, resolved_export)| {
+          (resolved_export.symbol_ref, resolved_export.came_from_commonjs)
+        }),
     );
   }
   // Entry chunk need to generate exports, so we need reference to all exports to make sure they are included in tree-shaking.
@@ -55,7 +57,8 @@ impl LinkStage<'_> {
       |ecma_module| {
         let linking_info = &mut self.metas[ecma_module.idx];
 
-        if let Some(entry) = self.entries.iter().find(|entry| entry.idx == ecma_module.idx) {
+        if let Some(entry) = self.entries.get(&ecma_module.idx).and_then(|entries| entries.first())
+        {
           init_entry_point_stmt_info(
             linking_info,
             entry,

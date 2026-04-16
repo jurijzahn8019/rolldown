@@ -137,7 +137,7 @@ The git submodule should have been initialized after running `just setup` when s
 You can run the test262 integration tests with the following command:
 
 ```shell
-TEST262_FILTER="attribute" cargo test --test integration_test262 -- --no-capture
+TEST262_FILTER="attribute" cargo test --test integration test262_module_code -- --no-capture
 ```
 
 - `TEST262_FILTER` allows you to filter tests by name (e.g., `"attribute"`). If you omit this environment variable, all test cases will be run. Note that the result snapshot will not be updated if the environment variable is set.
@@ -216,6 +216,9 @@ just test-node-rollup --grep "function"
 ```
 
 This will run only tests whose names match "function". For more filtering options, see [Mocha's grep documentation](https://mochajs.org/#grep).
+
+> [!NOTE]
+> Some Rollup tests require specific Node.js versions to run. Tests specify a `minNodeVersion` in their `_config.js` file and are automatically skipped when the running Node version is older than required. The number of passed tests will differ unless your Node version is 24 or higher.
 
 ## How to choose test technique
 

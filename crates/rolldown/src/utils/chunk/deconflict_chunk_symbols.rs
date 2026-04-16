@@ -1,12 +1,15 @@
-use oxc::span::CompactStr;
+use oxc_str::CompactStr;
 
 use crate::{
   stages::link_stage::LinkStageOutput,
-  utils::renamer::{NestedScopeRenamer, Renamer},
+  utils::{
+    external_import_interop::{external_import_needs_interop, specifier_needs_interop},
+    renamer::{NestedScopeRenamer, Renamer},
+  },
 };
 use arcstr::ArcStr;
 use rolldown_common::{
-  Chunk, ChunkIdx, ChunkKind, GetLocalDb, OutputFormat, TaggedSymbolRef, WrapKind,
+  Chunk, ChunkIdx, ChunkKind, GetLocalDb, NormalModule, OutputFormat, TaggedSymbolRef, WrapKind,
 };
 use rolldown_utils::ecmascript::legitimize_identifier_name;
 use rustc_hash::FxHashMap;
@@ -60,19 +63,6 @@ pub fn deconflict_chunk_symbols(
       .for_each(|external_module| {
         renamer.add_symbol_in_root_scope(external_module.namespace_ref, true);
       });
-    if let Some(module) = chunk.entry_module_idx() {
-      let entry_module =
-        link_output.module_table[module].as_normal().expect("should be normal module");
-      link_output.metas[entry_module.idx].star_exports_from_external_modules.iter().for_each(
-        |rec_idx| {
-          let rec = &entry_module.ecma_view.import_records[*rec_idx];
-          let external_module = &link_output.module_table[rec.into_resolved_module()]
-            .as_external()
-            .expect("Should be external module here");
-          renamer.add_symbol_in_root_scope(external_module.namespace_ref, true);
-        },
-      );
-    }
   }
 
   match chunk.kind {
@@ -97,12 +87,6 @@ pub fn deconflict_chunk_symbols(
           renamer.add_symbol_in_root_scope(symbol_ref, true);
         }
       });
-      for symbol_id in db.ast_scopes.facade_symbol_classic_data().keys() {
-        let symbol_ref = (*module, *symbol_id).into();
-        if link_output.used_symbol_refs.contains(&symbol_ref) {
-          renamer.add_symbol_in_root_scope(symbol_ref, true);
-        }
-      }
     });
   }
 
@@ -125,7 +109,7 @@ pub fn deconflict_chunk_symbols(
       module
         .stmt_infos
         .iter_enumerated()
-        .filter(|(idx, _)| meta.stmt_info_included[*idx])
+        .filter(|(idx, _)| meta.stmt_info_included.has_bit(*idx))
         .for_each(|(_, stmt_info)| {
           for declared_symbol in stmt_info
             .declared_symbols
@@ -184,7 +168,45 @@ pub fn deconflict_chunk_symbols(
     })
     .collect();
 
-  rename_shadowing_symbols_in_nested_scopes(chunk, link_output, &mut renamer);
+  // Detect mixed-mode external imports: both ESM (node-mode) and non-ESM importers
+  // needing interop on the same external. Create a separate binding name for node-mode.
+  if matches!(format, OutputFormat::Iife | OutputFormat::Umd | OutputFormat::Cjs) {
+    let mut node_mode_names = FxHashMap::default();
+    for (ext_idx, named_imports) in &chunk.direct_imports_from_external_modules {
+      if !external_import_needs_interop(named_imports) {
+        continue;
+      }
+      let mut has_node_mode = false;
+      let mut has_non_node_mode = false;
+      for (importer_idx, import) in named_imports {
+        if !specifier_needs_interop(&import.imported) {
+          continue;
+        }
+        if link_output.module_table[*importer_idx]
+          .as_normal()
+          .is_some_and(NormalModule::should_consider_node_esm_spec_for_static_import)
+        {
+          has_node_mode = true;
+        } else {
+          has_non_node_mode = true;
+        }
+        if has_node_mode && has_non_node_mode {
+          break;
+        }
+      }
+      if has_node_mode && has_non_node_mode {
+        let ext =
+          link_output.module_table[*ext_idx].as_external().expect("Should be external module here");
+        let canonical_ref = link_output.symbol_db.canonical_ref_for(ext.namespace_ref);
+        let original_name = canonical_ref.name(&link_output.symbol_db);
+        let node_name = renamer.create_conflictless_name(original_name);
+        node_mode_names.insert(canonical_ref, CompactStr::new(&node_name));
+      }
+    }
+    chunk.node_mode_external_ns_names = node_mode_names;
+  }
+
+  rename_shadowing_symbols_in_nested_scopes(chunk, link_output, format, &mut renamer);
 
   chunk.canonical_names = renamer.into_canonical_names();
 }
@@ -197,6 +219,7 @@ pub fn deconflict_chunk_symbols(
 fn rename_shadowing_symbols_in_nested_scopes<'a>(
   chunk: &Chunk,
   link_output: &'a LinkStageOutput,
+  output_format: OutputFormat,
   renamer: &mut Renamer<'a>,
 ) {
   // Same as above, starts with entry module to give entry module symbols naming priority.
@@ -219,6 +242,9 @@ fn rename_shadowing_symbols_in_nested_scopes<'a>(
 
     ctx.rename_bindings_shadowing_star_imports();
     ctx.rename_bindings_shadowing_named_imports();
-    ctx.rename_bindings_shadowing_cjs_params();
+    ctx.rename_bindings_shadowing_wrapper_params(matches!(
+      output_format,
+      OutputFormat::Iife | OutputFormat::Umd | OutputFormat::Cjs
+    ));
   }
 }

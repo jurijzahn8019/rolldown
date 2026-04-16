@@ -6,21 +6,24 @@ use arcstr::ArcStr;
 use futures::future::join_all;
 use itertools::Itertools;
 use oxc::semantic::{ScopeId, Scoping};
+use oxc::span::Span;
 use oxc::transformer_plugins::ReplaceGlobalDefinesConfig;
 use oxc_allocator::Address;
 use oxc_index::IndexVec;
 use rolldown_common::dynamic_import_usage::DynamicImportExportsUsage;
 use rolldown_common::{
-  EcmaRelated, EntryPoint, EntryPointKind, ExternalModule, ExternalModuleTaskResult, FlatOptions,
-  HybridIndexVec, ImportKind, ImportRecordIdx, ImportRecordMeta, ImportedExports, ImporterRecord,
-  Module, ModuleId, ModuleIdx, ModuleLoaderMsg, ModuleType, NormalModuleTaskResult,
-  PreserveEntrySignatures, RUNTIME_MODULE_ID, ResolvedId, RuntimeModuleBrief,
-  RuntimeModuleTaskResult, ScanMode, SourceMapGenMsg, StmtInfoIdx, SymbolRefDb,
+  EcmaModuleAstUsage, EcmaRelated, EntryPoint, EntryPointKind, ExternalModule,
+  ExternalModuleTaskResult, FlatOptions, HybridIndexVec, ImportKind, ImportRecordIdx,
+  ImportRecordMeta, ImportedExports, ImporterRecord, Module, ModuleId, ModuleIdx, ModuleLoaderMsg,
+  ModuleType, NormalModuleTaskResult, PreserveEntrySignatures, RUNTIME_MODULE_ID, ResolvedId,
+  RuntimeModuleBrief, RuntimeModuleTaskResult, ScanMode, SourceMapGenMsg, StmtInfoIdx, SymbolRefDb,
   SymbolRefDbForModule,
 };
 use rolldown_ecmascript::EcmaAst;
-use rolldown_error::{BuildDiagnostic, BuildResult, DiagnosableResolveError};
-use rolldown_fs::OsFileSystem;
+use rolldown_error::{
+  BuildDiagnostic, BuildResult, DiagnosableResolveError, consolidate_diagnostics,
+};
+use rolldown_fs::FileSystem;
 use rolldown_plugin::SharedPluginDriver;
 use rolldown_utils::indexmap::FxIndexSet;
 use rolldown_utils::rayon::{IntoParallelIterator, ParallelIterator};
@@ -28,12 +31,13 @@ use rolldown_utils::rustc_hash::FxHashSetExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::Instrument;
 
+use crate::module_loader::module_task::ModuleTaskOwner;
 use crate::types::scan_stage_cache::ScanStageCache;
 use crate::utils::load_entry_module::load_entry_module;
 use crate::{SharedOptions, SharedResolver};
 
 use super::external_module_task::ExternalModuleTask;
-use super::module_task::{ModuleTask, ModuleTaskOwnerRef};
+use super::module_task::ModuleTask;
 use super::runtime_module_task::RuntimeModuleTask;
 use super::task_context::{TaskContext, TaskContextMeta};
 
@@ -75,11 +79,6 @@ impl IntermediateNormalModules {
     }
     i
   }
-
-  pub fn reset_ecma_module_idx(&mut self) {
-    self.modules.clear();
-    self.index_ecma_ast.clear();
-  }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -96,10 +95,9 @@ impl VisitState {
   }
 }
 
-pub struct ModuleLoader<'a> {
-  pub shared_context: Arc<TaskContext>,
+pub struct ModuleLoader<'a, Fs: FileSystem + Clone + 'static> {
+  pub shared_context: Arc<TaskContext<Fs>>,
   rx: tokio::sync::mpsc::Receiver<ModuleLoaderMsg>,
-  runtime_idx: ModuleIdx,
   remaining: u32,
   intermediate_normal_modules: IntermediateNormalModules,
   symbol_ref_db: SymbolRefDb,
@@ -108,6 +106,11 @@ pub struct ModuleLoader<'a> {
   cache: &'a mut ScanStageCache,
   pub flat_options: FlatOptions,
   pub magic_string_tx: Option<Arc<std::sync::mpsc::Sender<SourceMapGenMsg>>>,
+  tla_module_count: usize,
+  /// Centralized map from modules that contain top-level `await` to the span
+  /// of the first TLA keyword. Stored here instead of on every `EcmaView`
+  /// because top-level await is rarely used in real-world apps.
+  tla_keyword_span_map: FxHashMap<ModuleIdx, Span>,
 }
 
 pub struct ModuleLoaderOutput {
@@ -128,19 +131,22 @@ pub struct ModuleLoaderOutput {
   /// e.g. https://stackblitz.com/edit/rolldown-rolldown-starter-stackblitz-jqg7vnkw?file=rolldown.config.mjs,src%2Findex.js,package.json
   pub entry_point_to_reference_ids: FxHashMap<EntryPoint, Vec<ArcStr>>,
   pub flat_options: FlatOptions,
+  pub user_defined_entry_modules: FxHashSet<ModuleIdx>,
+  pub tla_module_count: usize,
+  pub tla_keyword_span_map: FxHashMap<ModuleIdx, Span>,
 }
 
-impl Drop for ModuleLoader<'_> {
+impl<Fs: FileSystem + Clone> Drop for ModuleLoader<'_, Fs> {
   fn drop(&mut self) {
     self.cache.importers = std::mem::take(&mut self.intermediate_normal_modules.importers);
   }
 }
 
-impl<'a> ModuleLoader<'a> {
+impl<'a, Fs: FileSystem + Clone + 'static> ModuleLoader<'a, Fs> {
   pub fn new(
-    fs: OsFileSystem,
+    fs: Fs,
     options: SharedOptions,
-    resolver: SharedResolver,
+    resolver: SharedResolver<Fs>,
     plugin_driver: SharedPluginDriver,
     cache: &'a mut ScanStageCache,
     is_full_scan: bool,
@@ -154,7 +160,7 @@ impl<'a> ModuleLoader<'a> {
     }
 
     let flat_options = FlatOptions::from_shared_options(&options);
-    let symbol_ref_db = SymbolRefDb::new(options.transform_options.is_jsx_preserve());
+    let symbol_ref_db = SymbolRefDb::new();
     let meta = TaskContextMeta {
       replace_global_define_config: if options.define.is_empty() {
         None
@@ -171,28 +177,15 @@ impl<'a> ModuleLoader<'a> {
     // 1024 should be enough for most cases
     // over 1024 pending tasks are insane
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
-    let shared_context = Arc::new(TaskContext { fs, options, resolver, plugin_driver, tx, meta });
+    let shared_context = Arc::new(TaskContext { options, tx, resolver, fs, plugin_driver, meta });
 
     let importers = std::mem::take(&mut cache.importers);
-    let mut intermediate_normal_modules = IntermediateNormalModules::new(is_full_scan, importers);
-
-    let runtime_idx = intermediate_normal_modules.alloc_ecma_module_idx();
-    let remaining = if let Entry::Vacant(e) = cache.module_id_to_idx.entry(RUNTIME_MODULE_ID) {
-      let task = RuntimeModuleTask::new(runtime_idx, Arc::clone(&shared_context), flat_options);
-      tokio::spawn(task.run());
-      e.insert(VisitState::Seen(runtime_idx));
-      1
-    } else {
-      // the first alloc just want to allocate the runtime module id
-      intermediate_normal_modules.reset_ecma_module_idx();
-      0
-    };
+    let intermediate_normal_modules = IntermediateNormalModules::new(is_full_scan, importers);
 
     Ok(Self {
       rx,
       cache,
-      remaining,
-      runtime_idx,
+      remaining: 0,
       is_full_scan,
       shared_context,
       symbol_ref_db,
@@ -200,6 +193,8 @@ impl<'a> ModuleLoader<'a> {
       new_added_modules_from_partial_scan: FxIndexSet::default(),
       flat_options,
       magic_string_tx,
+      tla_module_count: 0,
+      tla_keyword_span_map: FxHashMap::default(),
     })
   }
 
@@ -207,7 +202,7 @@ impl<'a> ModuleLoader<'a> {
   fn try_spawn_new_task(
     &mut self,
     resolved_id: ResolvedId,
-    owner: Option<ModuleTaskOwnerRef>,
+    owner: Option<ModuleTaskOwner>,
     is_user_defined_entry: bool,
     assert_module_type: Option<&ModuleType>,
     user_defined_entries: &Arc<Vec<(Option<ArcStr>, ResolvedId)>>,
@@ -258,7 +253,7 @@ impl<'a> ModuleLoader<'a> {
         ctx,
         idx,
         resolved_id,
-        owner.map(Into::into),
+        owner,
         is_user_defined_entry,
         assert_module_type.cloned(),
         self.flat_options,
@@ -285,6 +280,15 @@ impl<'a> ModuleLoader<'a> {
   ) -> BuildResult<ModuleLoaderOutput> {
     let mut errors = vec![];
     let mut all_warnings = vec![];
+
+    // Initialize runtime module task if not yet started
+    if let Entry::Vacant(e) = self.cache.module_id_to_idx.entry(RUNTIME_MODULE_ID) {
+      let idx = self.intermediate_normal_modules.alloc_ecma_module_idx();
+      let task = RuntimeModuleTask::new(idx, Arc::clone(&self.shared_context), self.flat_options);
+      tokio::spawn(task.run().instrument(tracing::info_span!("runtime_module_task")));
+      e.insert(VisitState::Seen(idx));
+      self.remaining += 1;
+    }
 
     let user_defined_entries = Arc::new(match fetch_mode {
       ScanMode::Full => self.resolve_user_defined_entries().await?,
@@ -364,19 +368,16 @@ impl<'a> ModuleLoader<'a> {
           let NormalModuleTaskResult {
             mut module,
             mut barrel_info,
-            ecma_related: EcmaRelated { ast, symbols, mut dynamic_import_rec_exports_usage },
+            ecma_related:
+              EcmaRelated { ast, symbols, mut dynamic_import_rec_exports_usage, preserve_jsx },
             resolved_deps,
             raw_import_records,
             warnings,
+            tla_keyword_span,
           } = *task_result;
           all_warnings.extend(warnings);
 
-          // Make this.emitFile generated module as user defined entry if needed
           let module_idx = module.idx();
-          if user_defined_entry_ids.contains(&module_idx) {
-            let normal_module = module.as_normal_mut().expect("should be normal module");
-            normal_module.is_user_defined_entry = true;
-          }
 
           // remove importers from previous scan
           if !self.is_full_scan
@@ -392,11 +393,24 @@ impl<'a> ModuleLoader<'a> {
           }
 
           let normal_module = module.as_normal().unwrap();
-          let (mut all_imported_specifiers, mut initial_needed_records) =
-            self.cache.barrel_state.initialize_barrel_tracking(normal_module, &mut barrel_info);
+          if normal_module.ast_usage.contains(EcmaModuleAstUsage::TopLevelAwait) {
+            self.tla_module_count += 1;
+          }
+          if let Some(span) = tla_keyword_span {
+            self.tla_keyword_span_map.insert(module_idx, span);
+          }
+          let mut import_records = IndexVec::with_capacity(raw_import_records.len());
 
           let mut tracked_records = FxHashMap::default();
-          let mut import_records = IndexVec::with_capacity(raw_import_records.len());
+          let mut initialized_barrel_tracking =
+            self.flat_options.is_lazy_barrel_enabled().then(|| {
+              self.cache.barrel_state.initialize_barrel_tracking(
+                normal_module,
+                &raw_import_records,
+                &mut barrel_info,
+              )
+            });
+
           for ((rec_idx, mut raw_rec), resolved_id) in
             raw_import_records.into_iter_enumerated().zip(resolved_deps)
           {
@@ -406,59 +420,38 @@ impl<'a> ModuleLoader<'a> {
               raw_rec.meta.insert(ImportRecordMeta::JsonModule);
             }
 
-            // If `initial_needed_records` exists, we only need to load partial re-export import records
-            if let Some(ref initial_needed_records) = initial_needed_records
-              && raw_rec.meta.contains(ImportRecordMeta::IsReExport)
+            // Lazy barrel optimization: skip loading modules that are not needed yet.
+            // - `imported_exports_per_record`: maps all import records to their required imported exports
+            // - `initial_needed_records`: subset of records that need to be loaded initially
+            if let Some((ref imported_exports_per_record, ref initial_needed_records)) =
+              initialized_barrel_tracking
+              && raw_rec.kind == ImportKind::Import
             {
-              // For `export * from`, its specifier is always `All`.
-              // Since it's not in `named_imports`, it wasn't added to `all_imported_specifiers`
-              // in `initialize_barrel_tracking`, so we handle it here.
-              if raw_rec.meta.contains(ImportRecordMeta::IsExportStar) {
-                all_imported_specifiers.insert(rec_idx, ImportedExports::All);
-              }
-              // If this re-export still exists in `all_imported_specifiers`,
-              // some of its specifiers are needed and may be imported by other modules,
-              // so it needs to be tracked.
-              if all_imported_specifiers.contains_key(&rec_idx) {
+              // Track remaining import records for later on-demand loading
+              if imported_exports_per_record.contains_key(&rec_idx) {
                 tracked_records.insert(rec_idx, (raw_rec.state.clone(), resolved_id.clone()));
               }
-              // If this re-export is not in `initial_needed_records`, we don't need to load it
+              // Skip records not in initial_needed_records - they may be loaded later if needed
               if !initial_needed_records.contains_key(&rec_idx) {
                 import_records.push(raw_rec.into_resolved(None));
                 continue;
               }
             }
 
+            let is_external = resolved_id.external.is_external();
             let idx = self.try_spawn_new_task(
               resolved_id,
-              Some(ModuleTaskOwnerRef::new(normal_module, raw_rec.span)),
+              Some(ModuleTaskOwner::new(normal_module, raw_rec.span)),
               false,
               raw_rec.asserted_module_type.as_ref(),
               &user_defined_entries,
             );
 
-            if self.shared_context.options.experimental.is_lazy_barrel_enabled() {
-              // Only distinguish specific imported symbols for `import` statements;
-              // otherwise, treat as importing all.
+            if let Some((_, ref mut initial_needed_records)) = initialized_barrel_tracking {
               let imported_exports = if raw_rec.kind == ImportKind::Import {
-                // If exists in `initial_needed_records`, take the needed specifiers from it first.
-                // Only when `initial_needed_records` is `None` will we fall through to the branches below.
-                // `None` means we need to load all imported specifiers.
-                // Note: we already continued above via `!initial_needed_records.contains_key(&rec_idx)` above.
-                if let Some(imported_exports) =
-                  initial_needed_records.as_mut().and_then(|r| r.remove(&rec_idx))
-                {
-                  imported_exports
-                } else if let Some(imported_exports) = all_imported_specifiers.remove(&rec_idx) {
-                  // This is `import { a } from '..'` form, all its specifiers need to be recorded
-                  imported_exports
-                } else if raw_rec.meta.contains(ImportRecordMeta::IsExportStar) {
-                  // `export * from '..'` form, its specifier is always `All`
-                  ImportedExports::All
-                } else {
-                  // `import '..'` form, no symbols need to be recorded
-                  ImportedExports::Partial(FxHashSet::default())
-                }
+                initial_needed_records.remove(&rec_idx).expect(
+                  "If initial_needed_records does not contain the record idx, it should have been skipped above"
+                )
               } else {
                 ImportedExports::All
               };
@@ -476,7 +469,12 @@ impl<'a> ModuleLoader<'a> {
             if let Some(usage) = dynamic_import_rec_exports_usage.remove(&rec_idx) {
               dynamic_import_exports_usage_pairs.push((idx, usage));
             }
+            // External modules are excluded here to preserve the bit-position-to-ChunkIdx
+            // invariant in code splitting. User-defined and emitted entries are already
+            // guaranteed non-external by `load_entry_module()` which rejects them with
+            // `entry_cannot_be_external`.
             if matches!(raw_rec.kind, ImportKind::DynamicImport)
+              && !is_external
               && !user_defined_entry_ids.contains(&idx)
             {
               match dynamic_import_entry_ids.entry(idx) {
@@ -502,20 +500,24 @@ impl<'a> ModuleLoader<'a> {
           *self.intermediate_normal_modules.index_ecma_ast.get_mut(module_idx) = Some(ast);
           *self.intermediate_normal_modules.modules.get_mut(module_idx) = Some(module);
 
-          if self.shared_context.options.experimental.is_lazy_barrel_enabled() {
+          if let Some((imported_exports_per_record, _)) = initialized_barrel_tracking {
             self.cache.barrel_state.barrel_infos.insert(
               module_idx,
-              barrel_info.map(|info| {
-                // `tracked_records` and `all_imported_specifiers` have the same length and matching keys.
-                // `all_imported_specifiers` only contains the remaining specifiers for import records in `tracked_records`,
-                // after being filtered above and in `get_needed_records`.
-                info.into_barrel_module_state(tracked_records, all_imported_specifiers)
-              }),
+              if tracked_records.is_empty() {
+                None
+              } else {
+                barrel_info.map(|info| {
+                  info.into_barrel_module_state(tracked_records, imported_exports_per_record)
+                })
+              },
             );
             self.process_barrel_import_record(&mut work_queue, &user_defined_entries);
           }
 
           self.symbol_ref_db.store_local_db(module_idx, symbols);
+          if preserve_jsx {
+            self.symbol_ref_db.set_has_module_preserve_jsx();
+          }
           self.remaining -= 1;
         }
         ModuleLoaderMsg::ExternalModuleDone(task_result) => {
@@ -574,12 +576,13 @@ impl<'a> ModuleLoader<'a> {
           }
           module.import_records = import_records;
 
-          *self.intermediate_normal_modules.modules.get_mut(self.runtime_idx) = Some(module.into());
-          *self.intermediate_normal_modules.index_ecma_ast.get_mut(self.runtime_idx) = Some(ast);
+          *self.intermediate_normal_modules.modules.get_mut(runtime.id()) = Some(module.into());
+          *self.intermediate_normal_modules.index_ecma_ast.get_mut(runtime.id()) = Some(ast);
 
-          self.symbol_ref_db.store_local_db(self.runtime_idx, local_symbol_ref_db);
+          self.symbol_ref_db.store_local_db(runtime.id(), local_symbol_ref_db);
           self.remaining -= 1;
 
+          errors.extend(runtime.validate_symbols(&rolldown_common::RUNTIME_HELPER_NAMES));
           runtime_brief = Some(runtime);
         }
         ModuleLoaderMsg::FetchModule(resolve_id) => {
@@ -597,19 +600,7 @@ impl<'a> ModuleLoader<'a> {
 
           let module_idx = match result {
             Ok(resolved_id) => {
-              let idx =
-                self.try_spawn_new_task(resolved_id, None, true, None, &user_defined_entries);
-              // Make this.emitFile generated module as user defined entry if needed
-              if let Some(module) = self
-                .intermediate_normal_modules
-                .modules
-                .get_mut(idx)
-                .as_mut()
-                .and_then(|module| module.as_normal_mut())
-              {
-                module.is_user_defined_entry = true;
-              }
-              idx
+              self.try_spawn_new_task(resolved_id, None, true, None, &user_defined_entries)
             }
             Err(e) => {
               errors.push(e);
@@ -657,6 +648,7 @@ impl<'a> ModuleLoader<'a> {
         }
       }
 
+      let errors = consolidate_diagnostics(errors);
       return Err(errors.into());
     }
     if let Some(tx) = self.magic_string_tx.as_ref() {
@@ -724,10 +716,10 @@ impl<'a> ModuleLoader<'a> {
       let Some(module) = module.as_normal() else {
         return;
       };
-      self
-        .shared_context
-        .plugin_driver
-        .set_module_info(&module.id, Arc::new(module.to_module_info(None)));
+      self.shared_context.plugin_driver.set_module_info(
+        &module.id,
+        Arc::new(module.to_module_info(None, user_defined_entry_ids.contains(&module.idx))),
+      );
     });
 
     // Collect module indices from emitted entries to filter dynamic imports
@@ -777,6 +769,9 @@ impl<'a> ModuleLoader<'a> {
         &mut self.new_added_modules_from_partial_scan,
       ),
       flat_options: self.flat_options,
+      user_defined_entry_modules: user_defined_entry_ids,
+      tla_module_count: self.tla_module_count,
+      tla_keyword_span_map: std::mem::take(&mut self.tla_keyword_span_map),
     })
   }
 
@@ -908,13 +903,6 @@ impl<'a> ModuleLoader<'a> {
         }
       };
 
-      let mut barrel_module = self
-        .intermediate_normal_modules
-        .modules
-        .get_mut(idx)
-        .take()
-        .expect("barrel module should exist");
-
       let mut tracked_records = std::mem::take(&mut barrel_module_state.tracked_records);
       let mut remaining_imported_specifiers =
         std::mem::take(&mut barrel_module_state.remaining_imported_specifiers);
@@ -923,31 +911,78 @@ impl<'a> ModuleLoader<'a> {
       // Additionally, we check whether each record in `tracked_records` still needs to be retained.
       let mut needed_records = barrel_module_state
         .info
-        .get_needed_records(&new_exports, &mut remaining_imported_specifiers);
+        .take_needed_records(&new_exports, &mut remaining_imported_specifiers);
 
-      let barrel_normal_module = barrel_module.as_normal_mut().unwrap();
       tracked_records.retain(|&rec_idx, (import_record_state, resolved_id)| {
-        if let Some(ref needed_records) = needed_records {
-          if !needed_records.contains_key(&rec_idx) {
-            return true;
+        let Some(needed_record) = needed_records.remove(&rec_idx) else {
+          return true;
+        };
+
+        let mut is_module_from_cache_snapshot = false;
+        let barrel_normal_module = match &self.intermediate_normal_modules.modules {
+          HybridIndexVec::IndexVec(modules) => modules[idx]
+            .as_ref()
+            .expect("Barrel module should exists in full build")
+            .as_normal()
+            .unwrap(),
+          HybridIndexVec::Map(modules) => {
+            if let Some(module) = modules.get(&idx) {
+              module
+                .as_ref()
+                .expect("Barrel module should exists in partial build")
+                .as_normal()
+                .unwrap()
+            } else {
+              is_module_from_cache_snapshot = true;
+              self
+                .cache
+                .get_snapshot()
+                .module_table
+                .get(idx)
+                .expect("Barrel module should exist in cache snapshot in partial scan mode")
+                .as_normal()
+                .unwrap()
+            }
           }
-        }
+        };
+
         let target_idx = match barrel_normal_module.import_records[rec_idx].resolved_module {
           Some(existing_idx) => existing_idx,
           None => {
+            let importer_record = ImporterRecord {
+              kind: barrel_normal_module.import_records[rec_idx].kind,
+              importer_path: barrel_normal_module.id.clone(),
+              importer_idx: barrel_normal_module.idx,
+            };
             let new_idx = self.try_spawn_new_task(
               resolved_id.clone(),
-              Some(ModuleTaskOwnerRef::new(barrel_normal_module, import_record_state.span)),
+              Some(ModuleTaskOwner::new(barrel_normal_module, import_record_state.span)),
               false,
               import_record_state.asserted_module_type.as_ref(),
               user_defined_entries,
             );
-            barrel_normal_module.import_records[rec_idx].resolved_module = Some(new_idx);
-            self.intermediate_normal_modules.importers[new_idx].push(ImporterRecord {
-              kind: barrel_normal_module.import_records[rec_idx].kind,
-              importer_path: barrel_normal_module.id.clone(),
-              importer_idx: barrel_normal_module.idx,
-            });
+            self.intermediate_normal_modules.importers[new_idx].push(importer_record);
+            // Update resolved module in either cache snapshot or intermediate modules
+            if is_module_from_cache_snapshot {
+              self
+                .cache
+                .barrel_state
+                .resolved_barrel_modules
+                .entry(idx)
+                .or_default()
+                .push((rec_idx, new_idx));
+            } else {
+              self
+                .intermediate_normal_modules
+                .modules
+                .get_mut(idx)
+                .as_mut()
+                .expect("barrel module should exist")
+                .as_normal_mut()
+                .unwrap()
+                .import_records[rec_idx]
+                .resolved_module = Some(new_idx);
+            }
             new_idx
           }
         };
@@ -956,22 +991,19 @@ impl<'a> ModuleLoader<'a> {
           Some(None) => false,
           None => true,
         };
-        if let Some(imported_exports) = needed_records.as_mut().and_then(|r| r.remove(&rec_idx)) {
-          work_queue.push_back((target_idx, imported_exports));
-          return keep_tracking && remaining_imported_specifiers.contains_key(&rec_idx);
-        } else if let Some(imported_exports) = remaining_imported_specifiers.remove(&rec_idx) {
-          work_queue.push_back((target_idx, imported_exports));
-          return false;
+        work_queue.push_back((target_idx, needed_record));
+        if keep_tracking {
+          remaining_imported_specifiers.contains_key(&rec_idx)
+        } else {
+          remaining_imported_specifiers.remove(&rec_idx);
+          false
         }
-        keep_tracking
       });
 
       let barrel_module_state =
         self.cache.barrel_state.barrel_infos.get_mut(&idx).unwrap().as_mut().unwrap();
       barrel_module_state.tracked_records = tracked_records;
       barrel_module_state.remaining_imported_specifiers = remaining_imported_specifiers;
-
-      *self.intermediate_normal_modules.modules.get_mut(idx) = Some(barrel_module);
     }
   }
 }

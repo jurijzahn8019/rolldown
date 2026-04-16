@@ -10,7 +10,8 @@ use rolldown::ModuleType;
 use rolldown_common::WatcherChangeKind;
 use rolldown_plugin::{
   CustomField, HookLoadArgs, HookLoadOutput, HookResolveIdArgs, HookResolveIdOutput,
-  HookTransformArgs, PluginIdx, Pluginable, SharedTransformPluginContext, TransformPluginContext,
+  HookTransformArgs, LoadPluginContext, PluginIdx, PluginOrder, Pluginable,
+  SharedTransformPluginContext, TransformPluginContext,
 };
 use rolldown_plugin_vite_resolve::ResolveIdOptionsScan;
 use rolldown_utils::unique_arc::UniqueArc;
@@ -50,6 +51,30 @@ impl BindingCallableBuiltinPlugin {
         PluginIdx::new(0),
         None,
       )),
+    })
+  }
+
+  #[napi]
+  pub fn get_order(&self, hook_name: String) -> Option<String> {
+    let meta = match hook_name.as_str() {
+      "resolveId" => self.inner.call_resolve_id_meta(),
+      "load" => self.inner.call_load_meta(),
+      "transform" => self.inner.call_transform_meta(),
+      "watchChange" => self.inner.call_watch_change_meta(),
+      _ => None,
+    };
+    meta.and_then(|meta| {
+      meta.order.map(|order| {
+        (match order {
+          PluginOrder::Pre => "pre",
+          PluginOrder::Post => "post",
+          PluginOrder::PinPost => {
+            debug_assert!(false, "PinPost order is not supported in BindingCallableBuiltinPlugin");
+            "pre"
+          }
+        })
+        .to_string()
+      })
     })
   }
 
@@ -97,8 +122,10 @@ impl BindingCallableBuiltinPlugin {
     let context = Arc::clone(&self.context);
     crate::start_async_runtime();
     AsyncBlockBuilder::with(async move {
+      let module_idx = rolldown_common::ModuleIdx::new(0);
+      let load_ctx = Arc::new(LoadPluginContext::new(context.inner.clone(), module_idx));
       plugin
-        .call_load(&context.inner, &HookLoadArgs { id: &id })
+        .call_load(load_ctx, &HookLoadArgs { id: &id, module_idx, asserted_module_type: None })
         .await
         .map_err(AnyHowMaybeNapiError::into_napi_error)
         .map(|result| result.map(Into::into))
@@ -174,7 +201,7 @@ pub struct BindingHookJsResolveIdOptions {
 
 impl From<BindingHookJsResolveIdOptions> for Arc<CustomField> {
   fn from(value: BindingHookJsResolveIdOptions) -> Self {
-    let map = CustomField::default();
+    let mut map = CustomField::default();
     map.insert(ResolveIdOptionsScan, value.scan.unwrap_or(false));
     if let Some(is_sub_imports_pattern) =
       value.custom.and_then(|v| v.vite_import_glob.and_then(|v| v.is_sub_imports_pattern))

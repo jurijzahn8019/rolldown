@@ -123,6 +123,7 @@ impl ResolverConfig {
       main_fields,
       main_files: resolve_options.main_files.unwrap_or_else(|| vec!["index".to_string()]),
       modules: resolve_options.modules.unwrap_or_else(|| vec!["node_modules".into()]),
+      node_path: false,
       resolve_to_context: false,
       prefer_relative: false,
       prefer_absolute: false,
@@ -144,6 +145,6 @@ impl ResolverConfig {
     let css_options = default_options.clone().with_prefer_relative(true);
     let new_url_options = default_options.clone().with_prefer_relative(true);
 
-    Self { default_options, import_options, require_options, css_options, new_url_options }
+    Self { default_options, import_options, require_options, new_url_options, css_options }
   }
 }

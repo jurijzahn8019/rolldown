@@ -6,15 +6,11 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## entry.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-//#region node_modules/pkg/require.js
-var require_require = /* @__PURE__ */ __commonJSMin((() => {
-	console.log("SUCCESS");
-}));
-
-//#endregion
+// HIDDEN [\0rolldown/runtime.js]
 //#region src/entry.js
-require_require();
-
+(/* @__PURE__ */ __commonJSMin((() => {
+	console.log("SUCCESS");
+})))();
 //#endregion
+
 ```

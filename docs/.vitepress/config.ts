@@ -4,7 +4,9 @@ import path from 'node:path';
 import { type DefaultTheme, defineConfig } from 'vitepress';
 import { groupIconMdPlugin, groupIconVitePlugin } from 'vitepress-plugin-group-icons';
 import llmstxt from 'vitepress-plugin-llms';
-import { hooksGraphPlugin } from './markdown-hooks-graph.ts';
+import { addOgImage } from 'vitepress-plugin-og';
+import { graphvizMarkdownPlugin } from 'vitepress-plugin-graphviz';
+import { createHooksGraphProcessor } from './markdown-hooks-graph.ts';
 
 const sidebarForUserGuide: DefaultTheme.SidebarItem[] = [
   {
@@ -73,13 +75,15 @@ const sidebarForInDepth: DefaultTheme.SidebarItem[] = [
         text: 'Non ESM Output Formats',
         link: '/in-depth/non-esm-output-formats.md',
       },
+      { text: 'Dead Code Elimination', link: '/in-depth/dead-code-elimination.md' },
+      { text: 'Lazy Barrel Optimization', link: '/in-depth/lazy-barrel-optimization.md' },
       { text: 'Native MagicString', link: '/in-depth/native-magic-string.md' },
       {
         text: 'Why Plugin Hook Filter',
         link: '/in-depth/why-plugin-hook-filter.md',
       },
+      { text: 'External Modules', link: '/in-depth/external-modules.md' },
       { text: 'Directives', link: '/in-depth/directives.md' },
-      { text: 'Lazy Barrel Optimization', link: '/in-depth/lazy-barrel-optimization.md' },
     ],
   },
 ];
@@ -92,6 +96,10 @@ const importantAPIs: (string | undefined)[] = [
   '/Interface.PluginContext.md',
   '/Variable.VERSION.md',
   '/Function.defineConfig.md',
+  '/Function.minify.md',
+  '/Function.parse.md',
+  '/Function.transform.md',
+  '/Class.Visitor.md',
 ];
 
 function getTypedocSidebar() {
@@ -275,6 +283,12 @@ const config = defineConfig({
       },
     },
 
+    banner: {
+      id: 'viteplus-alpha',
+      text: 'Announcing Vite+ Alpha: Open source. Unified. Next-gen.',
+      url: 'https://voidzero.dev/posts/announcing-vite-plus-alpha?utm_source=rolldown&utm_content=top_banner',
+    },
+
     // https://vitepress.dev/reference/default-theme-config
     nav: [
       {
@@ -354,7 +368,7 @@ const config = defineConfig({
     ],
 
     footer: {
-      copyright: `© 2025 VoidZero Inc. and Rolldown contributors.`,
+      copyright: `© 2025-present VoidZero Inc. and Rolldown contributors.`,
       nav: [
         {
           title: 'Rolldown',
@@ -412,13 +426,23 @@ const config = defineConfig({
   markdown: {
     async config(md) {
       md.use(groupIconMdPlugin);
-      await hooksGraphPlugin(md);
+      await graphvizMarkdownPlugin(md as any, {
+        processors: { 'hooks-graph': createHooksGraphProcessor() },
+      });
     },
   },
-  transformPageData(pageData) {
+  async transformPageData(pageData, ctx) {
     // Disable "Edit this page on GitHub" for auto-generated reference docs
     if (pageData.relativePath.startsWith('reference/')) {
       pageData.frontmatter.editLink = false;
+    }
+
+    // Automatically handle OG images for all markdown files.
+    if (!pageData.frontmatter.image && pageData.relativePath !== 'index.md') {
+      await addOgImage(pageData, ctx, {
+        domain: 'https://rolldown.rs',
+        maxTitleSizePerLine: 16,
+      });
     }
   },
 });

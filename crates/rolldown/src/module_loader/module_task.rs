@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use arcstr::ArcStr;
 use oxc::span::Span;
-use oxc_index::IndexVec;
 use sugar_path::SugarPath as _;
 
 use rolldown_common::{
-  FlatOptions, ImportKind, ModuleIdx, ModuleInfo, ModuleLoaderMsg, ModuleType, NormalModule,
-  NormalModuleTaskResult, ResolvedId, SourceMapGenMsg, SourcemapChainElement, StrOrBytes,
-  try_extract_barrel_info,
+  ExportsKind, FlatOptions, ImportKind, ModuleIdx, ModuleInfo, ModuleLoaderMsg, ModuleType,
+  NormalModule, NormalModuleTaskResult, ResolvedId, SourceMapGenMsg, SourcemapChainElement,
+  StrOrBytes, try_extract_lazy_barrel_info,
 };
 use rolldown_error::{
   BuildDiagnostic, BuildResult, UnloadableDependencyContext, downcast_napi_error_diagnostics,
@@ -16,9 +15,9 @@ use rolldown_error::{
 use rolldown_std_utils::PathExt as _;
 use rolldown_utils::{ecmascript::legitimize_identifier_name, indexmap::FxIndexSet};
 
+use rolldown_fs::FileSystem;
+
 use crate::{
-  asset::create_asset_view,
-  css::create_css_view,
   ecmascript::ecma_module_view_factory::{CreateEcmaViewReturn, create_ecma_view},
   types::module_factory::{CreateModuleContext, CreateModuleViewArgs},
   utils::{load_source::load_source, transform_source::transform_source},
@@ -26,35 +25,24 @@ use crate::{
 
 use super::{resolve_utils::resolve_dependencies, task_context::TaskContext};
 
-pub struct ModuleTaskOwnerRef<'a> {
-  module: &'a NormalModule,
-  importee_span: Span,
-}
-
-impl<'a> ModuleTaskOwnerRef<'a> {
-  pub fn new(module: &'a NormalModule, importee_span: Span) -> Self {
-    Self { module, importee_span }
-  }
-}
-
-impl From<ModuleTaskOwnerRef<'_>> for ModuleTaskOwner {
-  fn from(owner: ModuleTaskOwnerRef) -> Self {
-    ModuleTaskOwner {
-      source: owner.module.source.clone(),
-      importer_id: owner.module.stable_id.as_arc_str().clone(),
-      importee_span: owner.importee_span,
-    }
-  }
-}
-
 pub struct ModuleTaskOwner {
   source: ArcStr,
   importer_id: ArcStr,
   importee_span: Span,
 }
 
-pub struct ModuleTask {
-  ctx: Arc<TaskContext>,
+impl ModuleTaskOwner {
+  pub fn new(normal_module: &NormalModule, importee_span: Span) -> Self {
+    Self {
+      source: normal_module.source.clone(),
+      importer_id: normal_module.stable_id.as_arc_str().clone(),
+      importee_span,
+    }
+  }
+}
+
+pub struct ModuleTask<Fs: FileSystem + Clone + 'static> {
+  ctx: Arc<TaskContext<Fs>>,
   module_idx: ModuleIdx,
   resolved_id: ResolvedId,
   owner: Option<ModuleTaskOwner>,
@@ -65,10 +53,10 @@ pub struct ModuleTask {
   magic_string_tx: Option<std::sync::Arc<std::sync::mpsc::Sender<SourceMapGenMsg>>>,
 }
 
-impl ModuleTask {
+impl<Fs: FileSystem + Clone + 'static> ModuleTask<Fs> {
   #[expect(clippy::too_many_arguments)]
   pub fn new(
-    ctx: Arc<TaskContext>,
+    ctx: Arc<TaskContext<Fs>>,
     idx: ModuleIdx,
     resolved_id: ResolvedId,
     owner: Option<ModuleTaskOwner>,
@@ -116,67 +104,46 @@ impl ModuleTask {
         imported_ids: FxIndexSet::default(),
         dynamically_imported_ids: FxIndexSet::default(),
         exports: vec![],
+        input_format: ExportsKind::None,
       }),
     );
 
     let mut sourcemap_chain = vec![];
     let mut hook_side_effects = self.resolved_id.side_effects.take();
-    let (mut source, module_type) = self
-      .load_source_without_cache(
-        &mut sourcemap_chain,
-        &mut hook_side_effects,
-        self.magic_string_tx.clone(),
-      )
+    let (source, module_type) = self
+      .load_source(&mut sourcemap_chain, &mut hook_side_effects, self.magic_string_tx.clone())
       .await?;
 
     let stable_id = id.stabilize(&self.ctx.options.cwd);
-    let mut raw_import_records = IndexVec::default();
 
-    let (asset_view, css_view) = match module_type {
-      ModuleType::Asset => {
-        let asset_view = create_asset_view(source);
-        source = StrOrBytes::Str(String::new());
-        (Some(asset_view), None)
-      }
-      ModuleType::Css => {
-        let css_source: ArcStr = source.try_into_string()?.into();
-        // FIXME: This makes creating `EcmaView` rely on creating `CssView` first, while they should be done in parallel.
-        let (css_view, css_raw_import_records) = create_css_view(&stable_id, &css_source);
-        raw_import_records = css_raw_import_records;
-        source = StrOrBytes::Str(String::new());
-        (None, Some(css_view))
-      }
-      _ => (None, None),
-    };
+    if matches!(module_type, ModuleType::Css) {
+      Err(BuildDiagnostic::unsupported_feature(
+        match &source { StrOrBytes::Bytes(_) => ArcStr::new(), StrOrBytes::Str(s) => s.into() },
+        id.as_arc_str().clone(),
+        Span::empty(0),
+        "Bundling CSS is no longer supported (experimental support has been removed). See https://github.com/rolldown/rolldown/issues/4271 for details.".to_string())
+      )?;
+    }
 
     let mut warnings = vec![];
 
-    let ret = create_ecma_view(
-      &mut CreateModuleContext {
-        stable_id: &stable_id,
-        module_idx: self.module_idx,
-        plugin_driver: &self.ctx.plugin_driver,
-        resolved_id: &self.resolved_id,
-        options: &self.ctx.options,
-        warnings: &mut warnings,
-        module_type: module_type.clone(),
-        replace_global_define_config: self.ctx.meta.replace_global_define_config.clone(),
-        is_user_defined_entry: self.is_user_defined_entry,
-        flat_options: self.flat_options,
-      },
-      CreateModuleViewArgs { source, sourcemap_chain, hook_side_effects },
-    )
-    .await?;
-
-    let CreateEcmaViewReturn {
-      mut ecma_view,
-      ecma_related,
-      raw_import_records: ecma_raw_import_records,
-    } = ret;
-
-    if css_view.is_none() {
-      raw_import_records = ecma_raw_import_records;
-    }
+    let CreateEcmaViewReturn { mut ecma_view, ecma_related, raw_import_records, tla_keyword_span } =
+      create_ecma_view(
+        &mut CreateModuleContext {
+          stable_id: &stable_id,
+          module_idx: self.module_idx,
+          plugin_driver: &self.ctx.plugin_driver,
+          resolved_id: &self.resolved_id,
+          options: &self.ctx.options,
+          warnings: &mut warnings,
+          module_type: module_type.clone(),
+          replace_global_define_config: self.ctx.meta.replace_global_define_config.clone(),
+          is_user_defined_entry: self.is_user_defined_entry,
+          flat_options: self.flat_options,
+        },
+        CreateModuleViewArgs { source, sourcemap_chain, hook_side_effects },
+      )
+      .await?;
 
     let resolved_deps = resolve_dependencies(
       &self.resolved_id,
@@ -190,30 +157,28 @@ impl ModuleTask {
     )
     .await?;
 
-    if css_view.is_none() {
-      for (record, info) in raw_import_records.iter().zip(&resolved_deps) {
-        match record.kind {
-          ImportKind::Import | ImportKind::Require | ImportKind::NewUrl => {
-            ecma_view.imported_ids.insert(info.id.clone());
-          }
-          ImportKind::DynamicImport => {
-            ecma_view.dynamically_imported_ids.insert(info.id.clone());
-          }
-          ImportKind::HotAccept => {
-            ecma_view.hmr_info.deps.insert(info.id.clone());
-          }
-          // for a none css module, we should not have `at-import` or `url-import`
-          ImportKind::AtImport | ImportKind::UrlImport => unreachable!(),
+    for (record, info) in raw_import_records.iter().zip(&resolved_deps) {
+      match record.kind {
+        ImportKind::Import | ImportKind::Require | ImportKind::NewUrl => {
+          ecma_view.imported_ids.insert(info.id.clone());
         }
+        ImportKind::DynamicImport => {
+          ecma_view.dynamically_imported_ids.insert(info.id.clone());
+        }
+        ImportKind::HotAccept => {
+          ecma_view.hmr_info.deps.insert(info.id.clone());
+        }
+        // for a none css module, we should not have `at-import` or `url-import`
+        ImportKind::AtImport | ImportKind::UrlImport => unreachable!(),
       }
     }
 
     let repr_name = self.resolved_id.id.as_path().representative_file_name();
     let repr_name = legitimize_identifier_name(&repr_name).into_owned();
 
-    // Build BarrelInfo for lazy barrel optimization
-    let barrel_info = if self.ctx.options.experimental.is_lazy_barrel_enabled() {
-      try_extract_barrel_info(&ecma_view, &raw_import_records)
+    // Build lazy barrel info if the experimental flag is enabled
+    let barrel_info = if self.flat_options.is_lazy_barrel_enabled() {
+      try_extract_lazy_barrel_info(&ecma_view, &raw_import_records)
     } else {
       None
     };
@@ -225,15 +190,13 @@ impl ModuleTask {
       debug_id: self.resolved_id.debug_id(&self.ctx.options.cwd),
       idx: self.module_idx,
       exec_order: u32::MAX,
-      is_user_defined_entry: self.is_user_defined_entry,
       module_type: module_type.clone(),
       ecma_view,
-      css_view,
-      asset_view,
       originative_resolved_id: self.resolved_id.clone(),
     };
 
-    let module_info = Arc::new(module.to_module_info(Some(&raw_import_records)));
+    let module_info =
+      Arc::new(module.to_module_info(Some(&raw_import_records), self.is_user_defined_entry));
     self.ctx.plugin_driver.set_module_info(&module.id, Arc::clone(&module_info));
     self.ctx.plugin_driver.module_parsed(Arc::clone(&module_info), &module).await?;
     self.ctx.plugin_driver.mark_context_load_modules_loaded(module.id.clone());
@@ -245,6 +208,7 @@ impl ModuleTask {
       raw_import_records,
       warnings,
       barrel_info,
+      tla_keyword_span,
     }));
 
     self.ctx.tx.send(result).await.expect(
@@ -255,7 +219,7 @@ impl ModuleTask {
   }
 
   #[tracing::instrument(level = "debug", skip_all)]
-  async fn load_source_without_cache(
+  async fn load_source(
     &self,
     sourcemap_chain: &mut Vec<SourcemapChainElement>,
     hook_side_effects: &mut Option<rolldown_common::side_effects::HookSideEffects>,
@@ -271,6 +235,7 @@ impl ModuleTask {
       &self.ctx.options,
       self.asserted_module_type.as_ref(),
       &mut is_read_from_disk,
+      self.module_idx,
     )
     .await;
     if is_read_from_disk {
@@ -291,9 +256,6 @@ impl ModuleTask {
         )
       })
     })?;
-    if let Some(asserted) = &self.asserted_module_type {
-      module_type = asserted.clone();
-    }
     let source = match source {
       _ if self.resolved_id.id.starts_with("rolldown:") => source,
       StrOrBytes::Str(source) => {

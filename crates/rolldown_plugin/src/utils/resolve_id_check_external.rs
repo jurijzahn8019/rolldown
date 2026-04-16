@@ -3,21 +3,22 @@ use crate::{
   types::{custom_field::CustomField, hook_resolve_id_skipped::HookResolveIdSkipped},
 };
 use arcstr::ArcStr;
+use nodejs_built_in_modules::is_nodejs_builtin_module;
 use rolldown_common::{
   ImportKind, MakeAbsoluteExternalsRelative, ModuleId, NormalizedBundlerOptions, ResolvedExternal,
   ResolvedId,
 };
+use rolldown_fs::FileSystem;
 use rolldown_resolver::{ResolveError, Resolver};
+use rolldown_utils::dataurl::is_data_url;
 use std::{path::Path, sync::Arc};
 use sugar_path::SugarPath;
 
 use crate::__inner::resolve_id_with_plugins;
 
-use super::resolve_id_with_plugins::is_data_url;
-
 #[expect(clippy::too_many_arguments)]
-pub async fn resolve_id_check_external(
-  resolver: &Resolver,
+pub async fn resolve_id_check_external<Fs: FileSystem>(
+  resolver: &Resolver<Fs>,
   plugin_driver: &PluginDriver,
   specifier: &str,
   importer: Option<&str>,
@@ -117,7 +118,13 @@ async fn resolve_external(
       ResolvedExternal::Absolute
     };
 
-  Ok(Some(ResolvedId { id: ModuleId::new(id), external, ..Default::default() }))
+  Ok(Some(ResolvedId {
+    is_external_without_side_effects: matches!(options.platform, rolldown_common::Platform::Node)
+      && is_nodejs_builtin_module(&id),
+    id: ModuleId::new(id),
+    external,
+    ..Default::default()
+  }))
 }
 
 fn is_not_absolute_external(
@@ -133,7 +140,9 @@ fn is_not_absolute_external(
 }
 
 fn normalize_relative_external_id(cwd: &Path, specifier: &str, importer: Option<&str>) -> ArcStr {
-  if !is_relative(specifier) || importer.is_some_and(is_data_url) {
+  if !is_relative(specifier)
+    || importer.is_some_and(|id| is_data_url(id) || id.starts_with("\0rolldown/data-url:"))
+  {
     return specifier.into();
   }
   let path = if let Some(importer) = importer {

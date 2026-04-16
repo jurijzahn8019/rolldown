@@ -3,9 +3,10 @@ import path from 'node:path';
 import type {
   BindingHookFilter,
   BindingHookResolveIdOutput,
+  BindingPluginContext,
   BindingPluginOptions,
 } from '../binding.cjs';
-import { BindingMagicString } from '../binding.cjs';
+import { RolldownMagicString } from '../binding-magic-string';
 import { parseAst } from '../parse-ast-index';
 import { bindingifySourcemap, type ExistingRawSourceMap } from '../types/sourcemap';
 import { aggregateBindingErrorsIntoJsError } from '../utils/error';
@@ -26,8 +27,24 @@ import {
   type PluginHookWithBindingExt,
 } from './bindingify-plugin-hook-meta';
 import type { PluginHooks, SourceDescription } from './index';
+import { LoadPluginContextImpl } from './load-plugin-context';
 import { PluginContextImpl } from './plugin-context';
 import { TransformPluginContextImpl } from './transform-plugin-context';
+
+function createPluginContext(
+  args: BindingifyPluginArgs,
+  ctx: BindingPluginContext,
+): PluginContextImpl {
+  return new PluginContextImpl(
+    args.outputOptions,
+    ctx,
+    args.plugin,
+    args.pluginContextData,
+    args.onLog,
+    args.logLevel,
+    args.watchMode,
+  );
+}
 
 export function bindingifyBuildStart(
   args: BindingifyPluginArgs,
@@ -41,15 +58,7 @@ export function bindingifyBuildStart(
   return {
     plugin: async (ctx, opts) => {
       await handler.call(
-        new PluginContextImpl(
-          args.outputOptions,
-          ctx,
-          args.plugin,
-          args.pluginContextData,
-          args.onLog,
-          args.logLevel,
-          args.watchMode,
-        ),
+        createPluginContext(args, ctx),
         args.pluginContextData.getInputOptions(opts),
       );
     },
@@ -68,15 +77,7 @@ export function bindingifyBuildEnd(
   return {
     plugin: async (ctx, err) => {
       await handler.call(
-        new PluginContextImpl(
-          args.outputOptions,
-          ctx,
-          args.plugin,
-          args.pluginContextData,
-          args.onLog,
-          args.logLevel,
-          args.watchMode,
-        ),
+        createPluginContext(args, ctx),
         err ? aggregateBindingErrorsIntoJsError(err) : undefined,
       );
     },
@@ -101,15 +102,7 @@ export function bindingifyResolveId(
           : undefined;
 
       const ret = await handler.call(
-        new PluginContextImpl(
-          args.outputOptions,
-          ctx,
-          args.plugin,
-          args.pluginContextData,
-          args.onLog,
-          args.logLevel,
-          args.watchMode,
-        ),
+        createPluginContext(args, ctx),
         specifier,
         importer ?? undefined,
         {
@@ -163,15 +156,7 @@ export function bindingifyResolveDynamicImport(
   return {
     plugin: async (ctx, specifier, importer) => {
       const ret = await handler.call(
-        new PluginContextImpl(
-          args.outputOptions,
-          ctx,
-          args.plugin,
-          args.pluginContextData,
-          args.onLog,
-          args.logLevel,
-          args.watchMode,
-        ),
+        createPluginContext(args, ctx),
         specifier,
         importer ?? undefined,
       );
@@ -223,14 +208,14 @@ export function bindingifyTransform(
 
   return {
     plugin: async (ctx, code, id, meta) => {
-      let magicStringInstance: BindingMagicString, astInstance: Program;
+      let magicStringInstance: RolldownMagicString, astInstance: Program;
       Object.defineProperties(meta, {
         magicString: {
           get() {
             if (magicStringInstance) {
               return magicStringInstance;
             }
-            magicStringInstance = new BindingMagicString(code);
+            magicStringInstance = new RolldownMagicString(code);
             return magicStringInstance;
           },
         },
@@ -290,8 +275,8 @@ export function bindingifyTransform(
       let map = ret.map;
       if (typeof ret.code === 'string') {
         normalizedCode = ret.code;
-      } else if (ret.code instanceof BindingMagicString) {
-        let magicString = ret.code as BindingMagicString;
+      } else if (ret.code instanceof RolldownMagicString) {
+        let magicString = ret.code as RolldownMagicString;
         normalizedCode = magicString.toString();
         // If the option is not enable we should just return soucemapJsonString
         let fallbackSourcemap = ctx.sendMagicString(magicString);
@@ -324,15 +309,16 @@ export function bindingifyLoad(
   return {
     plugin: async (ctx, id) => {
       const ret = await handler.call(
-        new PluginContextImpl(
+        new LoadPluginContextImpl(
           args.outputOptions,
-          ctx,
+          ctx.inner(),
           args.plugin,
           args.pluginContextData,
+          ctx,
+          id,
           args.onLog,
           args.logLevel,
           args.watchMode,
-          id,
         ),
         id,
       );
@@ -395,15 +381,7 @@ export function bindingifyModuleParsed(
   return {
     plugin: async (ctx, moduleInfo) => {
       await handler.call(
-        new PluginContextImpl(
-          args.outputOptions,
-          ctx,
-          args.plugin,
-          args.pluginContextData,
-          args.onLog,
-          args.logLevel,
-          args.watchMode,
-        ),
+        createPluginContext(args, ctx),
         transformModuleInfo(moduleInfo, args.pluginContextData.getModuleOption(moduleInfo.id)),
       );
     },

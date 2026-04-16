@@ -4,16 +4,14 @@ use crate::{
 };
 use nodejs_built_in_modules::is_nodejs_builtin_module;
 use rolldown_common::{ImportKind, ModuleDefFormat, ModuleId, PackageJson, ResolvedId};
+use rolldown_fs::FileSystem;
 use rolldown_resolver::{ResolveError, Resolver};
+use rolldown_utils::dataurl::is_data_url;
 use std::{path::Path, sync::Arc};
 use sugar_path::SugarPath;
 
 fn is_http_url(s: &str) -> bool {
   s.starts_with("http://") || s.starts_with("https://") || s.starts_with("//")
-}
-
-pub fn is_data_url(s: &str) -> bool {
-  s.trim_start().starts_with("data:")
 }
 
 /// Infers ModuleDefFormat from file path and optional package.json.
@@ -50,8 +48,8 @@ pub fn infer_module_def_format(
 }
 
 #[expect(clippy::too_many_arguments)]
-pub async fn resolve_id_with_plugins(
-  resolver: &Resolver,
+pub async fn resolve_id_with_plugins<Fs: FileSystem>(
+  resolver: &Resolver<Fs>,
   plugin_driver: &PluginDriver,
   specifier: &str,
   importer: Option<&str>,
@@ -133,13 +131,17 @@ pub async fn resolve_id_with_plugins(
   Ok(resolve_id(resolver, specifier, importer, import_kind, is_user_defined_entry))
 }
 
-fn resolve_id(
-  resolver: &Resolver,
+fn resolve_id<Fs: FileSystem>(
+  resolver: &Resolver<Fs>,
   specifier: &str,
   importer: Option<&str>,
   import_kind: ImportKind,
   is_user_defined_entry: bool,
 ) -> Result<ResolvedId, ResolveError> {
+  // Data URL modules have no filesystem location, so imports from them cannot be resolved.
+  if importer.is_some_and(|id| id.starts_with("\0rolldown/data-url:")) {
+    return Err(ResolveError::NotFound(specifier.to_string()));
+  }
   let resolved =
     resolver.resolve(importer.map(Path::new), specifier, import_kind, is_user_defined_entry);
 

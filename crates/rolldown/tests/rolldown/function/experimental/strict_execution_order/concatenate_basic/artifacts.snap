@@ -6,20 +6,12 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## main.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-
-var init_main = __esmMin((() => {
-//#region setup.js
-	globalThis.globalValue = "foo";
-
-//#endregion
-//#region main.js
+// HIDDEN [\0rolldown/runtime.js]
+	//#region main.js
 	console.log("main");
+	//#endregion
+}))();
 
-//#endregion
-}));
-
-init_main();
 ```
 
 # Variant: [profiler_names: false]
@@ -29,20 +21,12 @@ init_main();
 ### main.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-
-var init_main = __esmMin((() => {
-//#region setup.js
-	globalThis.globalValue = "foo";
-
-//#endregion
-//#region main.js
+// HIDDEN [\0rolldown/runtime.js]
+	//#region main.js
 	console.log("main");
+	//#endregion
+}))();
 
-//#endregion
-}));
-
-init_main();
 ```
 
 # Variant: [pife_for_module_wrappers: false]
@@ -52,18 +36,10 @@ init_main();
 ### main.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-
-var init_main = __esmMin(() => {
-//#region setup.js
-	globalThis.globalValue = "foo";
-
-//#endregion
-//#region main.js
+// HIDDEN [\0rolldown/runtime.js]
+	//#region main.js
 	console.log("main");
+	//#endregion
+})();
 
-//#endregion
-});
-
-init_main();
 ```

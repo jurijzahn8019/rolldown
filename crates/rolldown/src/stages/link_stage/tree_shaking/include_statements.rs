@@ -9,8 +9,9 @@ use rolldown_common::{
   ImportKind, ImportRecordIdx, ImportRecordMeta, IndexModules, Module, ModuleIdx,
   ModuleNamespaceIncludedReason, ModuleType, NormalModule, NormalizedBundlerOptions,
   RUNTIME_HELPER_NAMES, RUNTIME_MODULE_ID, RuntimeHelper, RuntimeModuleBrief, SideEffectDetail,
-  StmtInfoIdx, StmtInfoMeta, StmtInfos, SymbolIdExt, SymbolOrMemberExprRef, SymbolRef, SymbolRefDb,
-  dynamic_import_usage::DynamicImportExportsUsage, side_effects::DeterminedSideEffects,
+  StmtInfoIdx, StmtInfoMeta, StmtInfos, SymbolOrMemberExprRef, SymbolRef, SymbolRefDb,
+  UsedSymbolRefs, dynamic_import_usage::DynamicImportExportsUsage,
+  side_effects::DeterminedSideEffects,
 };
 #[cfg(not(target_family = "wasm"))]
 use rolldown_utils::rayon::IndexedParallelIterator;
@@ -18,12 +19,14 @@ use rolldown_utils::rayon::{
   IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
+use rolldown_utils::IndexBitSet;
+use rolldown_utils::indexmap::FxIndexMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{stages::link_stage::LinkStage, types::linking_metadata::LinkingMetadataVec};
 
-pub type StmtInclusionVec = IndexVec<ModuleIdx, IndexVec<StmtInfoIdx, bool>>;
-pub type ModuleInclusionVec = IndexVec<ModuleIdx, bool>;
+pub type StmtInclusionVec = IndexVec<ModuleIdx, IndexBitSet<StmtInfoIdx>>;
+pub type ModuleInclusionVec = IndexBitSet<ModuleIdx>;
 pub type ModuleNamespaceReasonVec = IndexVec<ModuleIdx, ModuleNamespaceIncludedReason>;
 
 bitflags::bitflags! {
@@ -57,14 +60,16 @@ pub struct IncludeContext<'a> {
   pub inline_const_smart: bool,
   pub runtime_idx: ModuleIdx,
   pub metas: &'a LinkingMetadataVec,
-  pub used_symbol_refs: &'a mut FxHashSet<SymbolRef>,
+  pub used_symbol_refs: &'a mut UsedSymbolRefs,
   pub constant_symbol_map: &'a FxHashMap<SymbolRef, ConstExportMeta>,
   pub options: &'a NormalizedBundlerOptions,
   pub normal_symbol_exports_chain_map: &'a FxHashMap<SymbolRef, Vec<SymbolRef>>,
   /// It is necessary since we can't mutate `module.meta` during the tree shaking process.
   /// see [rolldown_common::ecmascript::ecma_view::EcmaViewMeta]
   pub bailout_cjs_tree_shaking_modules: FxHashSet<ModuleIdx>,
-  pub may_partial_namespace: bool,
+  /// Tracks whether any new module was included during the current convergence iteration.
+  /// Used to detect fixpoint without O(N) scanning of `is_module_included_vec`.
+  pub module_inclusion_changed: bool,
   pub module_namespace_included_reason: &'a mut ModuleNamespaceReasonVec,
   pub json_module_none_self_reference_included_symbol: FxHashMap<ModuleIdx, FxHashSet<SymbolRef>>,
 }
@@ -78,7 +83,7 @@ impl<'a> IncludeContext<'a> {
     is_module_included_vec: &'a mut ModuleInclusionVec,
     runtime_idx: ModuleIdx,
     metas: &'a LinkingMetadataVec,
-    used_symbol_refs: &'a mut FxHashSet<SymbolRef>,
+    used_symbol_refs: &'a mut UsedSymbolRefs,
     constant_symbol_map: &'a FxHashMap<SymbolRef, ConstExportMeta>,
     options: &'a NormalizedBundlerOptions,
     normal_symbol_exports_chain_map: &'a FxHashMap<SymbolRef, Vec<SymbolRef>>,
@@ -98,7 +103,7 @@ impl<'a> IncludeContext<'a> {
       options,
       normal_symbol_exports_chain_map,
       bailout_cjs_tree_shaking_modules: FxHashSet::default(),
-      may_partial_namespace: false,
+      module_inclusion_changed: false,
       module_namespace_included_reason,
       json_module_none_self_reference_included_symbol: FxHashMap::default(),
     }
@@ -114,10 +119,63 @@ fn include_cjs_bailout_exports(
     metas[idx]
       .resolved_exports
       .iter()
-      .filter_map(|(_name, local)| local.came_from_cjs.then_some(local))
+      .filter_map(|(_name, local)| local.came_from_commonjs.then_some(local))
       .for_each(|local| {
-        include_symbol(context, local.symbol_ref, SymbolIncludeReason::Normal);
+        include_symbol_and_check_cjs_bailout(
+          context,
+          local.symbol_ref,
+          SymbolIncludeReason::Normal,
+        );
       });
+  }
+}
+
+/// Include a symbol and check for CJS tree-shaking bailout.
+///
+/// Use this at most call sites. Only use bare [`include_symbol`] when you
+/// explicitly want to skip the bailout check (e.g., for partial CJS member-
+/// expression access or runtime symbols).
+fn include_symbol_and_check_cjs_bailout(
+  ctx: &mut IncludeContext,
+  symbol_ref: SymbolRef,
+  include_reason: SymbolIncludeReason,
+) {
+  include_symbol(ctx, symbol_ref, include_reason);
+  check_cjs_bailout(ctx, symbol_ref);
+}
+
+/// Check if including this symbol should trigger CJS tree-shaking bailout.
+/// This is called at `include_symbol` call sites where the symbol is NOT accessed
+/// via a resolved member expression on a CJS namespace (i.e., where the full namespace
+/// might be used opaquely). When we know only a specific property is accessed
+/// (member expression with `target_commonjs_exported_symbol`), we skip this check
+/// to allow CJS tree-shaking.
+fn check_cjs_bailout(ctx: &mut IncludeContext, symbol_ref: SymbolRef) {
+  let canonical_ref = ctx.symbols.canonical_ref_for(symbol_ref);
+
+  // If the symbol is a CJS namespace import ref, bail out the target CJS module.
+  if let Some(idx) =
+    ctx.metas[canonical_ref.owner].import_record_ns_to_cjs_module.get(&canonical_ref)
+  {
+    ctx.bailout_cjs_tree_shaking_modules.insert(*idx);
+  }
+  // If the symbol IS a CJS module's namespace object, bail out that module.
+  if ctx.modules[canonical_ref.owner].namespace_object_ref() == Some(canonical_ref) {
+    ctx.bailout_cjs_tree_shaking_modules.insert(canonical_ref.owner);
+  }
+
+  // If the symbol has a namespace_alias importing "default" from a CJS module,
+  // bail out that module (default import is the whole module.exports).
+  let canonical_ref_symbol = ctx.symbols.get(canonical_ref);
+  if let Some(namespace_alias) = &canonical_ref_symbol.namespace_alias {
+    if let Some(idx) = ctx.metas[namespace_alias.namespace_ref.owner]
+      .import_record_ns_to_cjs_module
+      .get(&namespace_alias.namespace_ref)
+    {
+      if namespace_alias.property_name.as_str() == "default" {
+        ctx.bailout_cjs_tree_shaking_modules.insert(*idx);
+      }
+    }
   }
 }
 
@@ -127,12 +185,12 @@ fn include_cjs_bailout_exports(
 fn collect_depended_runtime_helpers(
   modules: &IndexModules,
   metas: &LinkingMetadataVec,
-  is_module_included_vec: &IndexVec<ModuleIdx, bool>,
+  is_module_included_vec: &ModuleInclusionVec,
 ) -> RuntimeHelper {
   let iter = modules.par_iter().zip_eq(metas.par_iter()).filter_map(|(module, meta)| {
     module
       .as_normal()
-      .filter(|m| is_module_included_vec[m.idx])
+      .filter(|m| is_module_included_vec.has_bit(m.idx))
       .map(|_| meta.depended_runtime_helper)
   });
 
@@ -152,16 +210,19 @@ impl LinkStage<'_> {
       .modules
       .iter()
       .map(|m| {
-        m.as_normal().map_or(IndexVec::default(), |m| {
-          m.stmt_infos.iter().map(|_| false).collect::<IndexVec<StmtInfoIdx, _>>()
-        })
+        m.as_normal().map_or(IndexBitSet::default(), |m| IndexBitSet::new(m.stmt_infos.len()))
       })
       .collect::<IndexVec<ModuleIdx, _>>();
-    let mut used_symbol_refs = FxHashSet::default();
+    let mut used_symbol_refs = UsedSymbolRefs::default();
     let mut is_module_included_vec: ModuleInclusionVec =
-      oxc_index::index_vec![false; self.module_table.modules.len()];
+      IndexBitSet::new(self.module_table.modules.len());
     let mut module_namespace_included_reason: ModuleNamespaceReasonVec =
       oxc_index::index_vec![ModuleNamespaceIncludedReason::empty(); self.module_table.len()];
+    self.has_enum_inlining = self
+      .module_table
+      .modules
+      .iter()
+      .any(|m| m.as_normal().is_some_and(|n| !n.ecma_view.enum_member_value_map.is_empty()));
     let context = &mut IncludeContext::new(
       &self.module_table.modules,
       &self.symbols,
@@ -177,7 +238,10 @@ impl LinkStage<'_> {
     );
 
     let (user_defined_entries, mut dynamic_entries): (Vec<_>, Vec<_>) =
-      std::mem::take(&mut self.entries).into_iter().partition(|item| item.kind.is_user_defined());
+      std::mem::take(&mut self.entries)
+        .into_values()
+        .flatten()
+        .partition(|item| item.kind.is_user_defined());
     user_defined_entries.iter().filter(|entry| entry.kind.is_user_defined()).for_each(|entry| {
       let module = match &self.module_table[entry.idx] {
         Module::Normal(module) => module,
@@ -196,7 +260,11 @@ impl LinkStage<'_> {
                 include_statement(context, module, stmt_info_id);
               },
             );
-            include_symbol(context, *symbol_ref, SymbolIncludeReason::EntryExport);
+            include_symbol_and_check_cjs_bailout(
+              context,
+              *symbol_ref,
+              SymbolIncludeReason::EntryExport,
+            );
           }
         },
       );
@@ -205,10 +273,10 @@ impl LinkStage<'_> {
 
     let mut unused_record_idxs = vec![];
     let cycled_idx = self.sort_dynamic_entries_by_topological_order(&mut dynamic_entries);
-    let mut previous_included_module_count =
-      context.is_module_included_vec.iter().filter(|item| **item).count();
     let mut included_dynamic_entry = FxHashSet::default();
     loop {
+      context.module_inclusion_changed = false;
+
       // It could be safely take since it is no more used.
       // We extract bailout_modules first to avoid borrowing conflict:
       // passing `context` requires a mutable borrow, which conflicts with
@@ -232,27 +300,27 @@ impl LinkStage<'_> {
         }
       });
 
-      let current_included_module_count =
-        context.is_module_included_vec.iter().filter(|item| **item).count();
-
-      if current_included_module_count == previous_included_module_count {
+      if !context.module_inclusion_changed {
         break;
       }
-
-      previous_included_module_count = current_included_module_count;
     }
 
     dynamic_entries.retain(|entry| included_dynamic_entry.contains(&entry.idx));
 
     // update entries with lived only.
-    self.entries = user_defined_entries
-      .into_iter()
-      .chain(if self.options.code_splitting.is_disabled() {
-        itertools::Either::Left(std::iter::empty())
-      } else {
-        itertools::Either::Right(dynamic_entries.into_iter())
-      })
-      .collect();
+    self.entries = {
+      let mut entries = FxIndexMap::default();
+      for entry in
+        user_defined_entries.into_iter().chain(if self.options.code_splitting.is_disabled() {
+          itertools::Either::Left(std::iter::empty())
+        } else {
+          itertools::Either::Right(dynamic_entries.into_iter())
+        })
+      {
+        entries.entry(entry.idx).or_insert_with(Vec::new).push(entry);
+      }
+      entries
+    };
 
     // Setting the json module none self reference included symbol map
     for (mi, set) in std::mem::take(&mut context.json_module_none_self_reference_included_symbol) {
@@ -283,12 +351,13 @@ impl LinkStage<'_> {
           }
           let any_included = stmt_info_idxs
             .iter()
-            .any(|stmt_info_idx| is_stmt_info_included_vec[module.idx][*stmt_info_idx]);
+            .any(|stmt_info_idx| is_stmt_info_included_vec[module.idx].has_bit(*stmt_info_idx));
           #[expect(clippy::cast_possible_truncation)]
           // Note: `RuntimeHelper` is a bitmask with at most 32 bits, so the index is guaranteed to fit in u32.
           normalized_runtime_helper.set(
             RuntimeHelper::from_bits(1 << index as u32).unwrap(),
-            any_included || (module.id != RUNTIME_MODULE_ID && !is_module_included_vec[idx]),
+            any_included
+              || (module.id != RUNTIME_MODULE_ID && !is_module_included_vec.has_bit(idx)),
           );
           // We also need to process the runtime helper of the eliminate module so that we
           // could propagate them to its importers later
@@ -323,9 +392,9 @@ impl LinkStage<'_> {
       self.metas[module_idx].stmt_info_included = stmt_included_vec;
     });
     // Store the final module inclusion results back to metas.
-    is_module_included_vec.into_iter_enumerated().for_each(|(module_idx, is_included)| {
-      self.metas[module_idx].is_included = is_included;
-    });
+    for (module_idx, meta) in self.metas.iter_mut_enumerated() {
+      meta.is_included = is_module_included_vec.has_bit(module_idx);
+    }
 
     tracing::trace!(
       "included statements {:#?}",
@@ -377,7 +446,11 @@ impl LinkStage<'_> {
             include_statement(context, module, stmt_info_id);
           },
         );
-        include_symbol(context, *symbol_ref, SymbolIncludeReason::EntryExport);
+        include_symbol_and_check_cjs_bailout(
+          context,
+          *symbol_ref,
+          SymbolIncludeReason::EntryExport,
+        );
       }
     });
     include_module(context, module);
@@ -492,7 +565,7 @@ impl LinkStage<'_> {
   fn is_dynamic_entry_alive(
     &self,
     entry_point: &EntryPoint,
-    is_stmt_included_vec: &IndexVec<ModuleIdx, IndexVec<StmtInfoIdx, bool>>,
+    is_stmt_included_vec: &StmtInclusionVec,
     unreachable_import_expression_addrs: &FxHashSet<Address>,
   ) -> Option<Vec<(ModuleIdx, ImportRecordIdx)>> {
     let mut ret = vec![];
@@ -523,7 +596,7 @@ impl LinkStage<'_> {
               !importee_side_effects
                 && import_record.meta.contains(ImportRecordMeta::TopLevelPureDynamicImport)
             };
-            let is_stmt_included = is_stmt_included_vec[*module_idx][*stmt_idx];
+            let is_stmt_included = is_stmt_included_vec[*module_idx].has_bit(*stmt_idx);
             let lived = is_stmt_included
               && (!is_dynamic_imported_module_exports_unused || !all_dead_pure_dynamic_import);
 
@@ -544,7 +617,14 @@ pub fn include_runtime_symbol(
   runtime: &RuntimeModuleBrief,
   depended_runtime_helper: RuntimeHelper,
 ) {
+  let runtime_module = &ctx.modules[runtime.id()].as_normal().expect("runtime should be normal");
+
   if depended_runtime_helper.is_empty() {
+    // No runtime helpers needed, but if the runtime has side effects (e.g. from
+    // a plugin transform), we still need to include it.
+    if runtime_module.side_effects.has_side_effects() {
+      include_module(ctx, runtime_module);
+    }
     return;
   }
 
@@ -557,15 +637,15 @@ pub fn include_runtime_symbol(
 
 /// if no export is used, and the module has no side effects, the module should not be included
 pub fn include_module(ctx: &mut IncludeContext, module: &NormalModule) {
-  if ctx.is_module_included_vec[module.idx] {
+  if ctx.is_module_included_vec.has_bit(module.idx) {
     return;
   }
 
-  ctx.is_module_included_vec[module.idx] = true;
+  ctx.is_module_included_vec.set_bit(module.idx);
+  ctx.module_inclusion_changed = true;
 
-  if module.idx == ctx.runtime_idx {
-    // runtime module has no side effects and it's statements should be included
-    // by other modules's references.
+  if module.idx == ctx.runtime_idx && !module.side_effects.has_side_effects() {
+    // Unmodified runtime: statements included only via references.
     return;
   }
 
@@ -626,12 +706,12 @@ pub fn include_module(ctx: &mut IncludeContext, module: &NormalModule) {
   );
   if module.meta.has_eval() && matches!(module.module_type, ModuleType::Js | ModuleType::Jsx) {
     module.named_imports.keys().for_each(|symbol| {
-      include_symbol(ctx, *symbol, SymbolIncludeReason::Normal);
+      include_symbol_and_check_cjs_bailout(ctx, *symbol, SymbolIncludeReason::Normal);
     });
   }
 
   ctx.metas[module.idx].included_commonjs_export_symbol.iter().for_each(|symbol_ref| {
-    include_symbol(ctx, *symbol_ref, SymbolIncludeReason::Normal);
+    include_symbol_and_check_cjs_bailout(ctx, *symbol_ref, SymbolIncludeReason::Normal);
   });
 
   // With enabling HMR, rolldown will register included esm module's namespace object to the runtime.
@@ -653,11 +733,12 @@ pub fn include_symbol(
 
   if let Some(v) = ctx.constant_symbol_map.get(&canonical_ref)
     && !include_reason.contains(SymbolIncludeReason::EntryExport)
-    && !ctx.inline_const_smart
+    && (!ctx.inline_const_smart || v.safe_to_inline)
     && !v.commonjs_export
   {
-    // If the symbol is a constant value and it is not a commonjs module export , we don't need to include it since it would be always inline
-    // We don't need to add anyflag since if `inlineConst` is disabled, the test expr will always
+    // If the symbol is a constant value and it is not a commonjs module export, we don't need to include it since it would be always inlined.
+    // In smart mode, we only skip if `safe_to_inline` is true (meaning it will be inlined regardless of context).
+    // We don't need to add any flag since if `inlineConst` is disabled, the test expr will always
     // return `false`
     return;
   }
@@ -665,18 +746,8 @@ pub fn include_symbol(
   // Also include the symbol that points to the canonical ref.
   ctx.used_symbol_refs.insert(symbol_ref);
 
-  if !ctx.may_partial_namespace {
-    if let Some(idx) =
-      ctx.metas[canonical_ref.owner].import_record_ns_to_cjs_module.get(&canonical_ref)
-    {
-      ctx.bailout_cjs_tree_shaking_modules.insert(*idx);
-    }
-    if ctx.modules[canonical_ref.owner].as_normal().map(|m| m.namespace_object_ref)
-      == Some(canonical_ref)
-    {
-      ctx.bailout_cjs_tree_shaking_modules.insert(canonical_ref.owner);
-    }
-  }
+  // CJS bailout checks are handled by `include_symbol_and_check_cjs_bailout`
+  // at most call sites. This keeps `include_symbol` focused on inclusion only.
 
   let canonical_ref_symbol = ctx.symbols.get(canonical_ref);
   if let Some(namespace_alias) = &canonical_ref_symbol.namespace_alias {
@@ -684,35 +755,34 @@ pub fn include_symbol(
     if let Some(idx) =
       ctx.metas[canonical_ref.owner].import_record_ns_to_cjs_module.get(&canonical_ref)
     {
-      if !ctx.may_partial_namespace && namespace_alias.property_name.as_str() == "default" {
-        ctx.bailout_cjs_tree_shaking_modules.insert(*idx);
-      } else {
-        // handle case:
-        // ```js
-        // import {a} from './cjs.js'
-        // console.log(a)
-        // ```
-        ctx.modules[*idx].as_normal().inspect(|_| {
-          let Some(export_symbol) =
-            ctx.metas[*idx].resolved_exports.get(&namespace_alias.property_name)
-          else {
-            return;
-          };
-          if namespace_alias.property_name.as_str() != "default" {
-            include_symbol(ctx, export_symbol.symbol_ref, SymbolIncludeReason::Normal);
-          }
-        });
-      }
+      // Include specific named export from CJS module.
+      // Default import bailout is handled by check_cjs_bailout at call sites.
+      // ```js
+      // import {a} from './cjs.js'
+      // console.log(a)
+      // ```
+      ctx.modules[*idx].as_normal().inspect(|_| {
+        let Some(export_symbol) =
+          ctx.metas[*idx].resolved_exports.get(&namespace_alias.property_name)
+        else {
+          return;
+        };
+        if namespace_alias.property_name.as_str() != "default" {
+          include_symbol(ctx, export_symbol.symbol_ref, SymbolIncludeReason::Normal);
+        }
+      });
     }
   }
 
-  let is_simulated_facade_chunk = if canonical_ref.symbol.is_module_namespace() {
+  let is_module_namespace =
+    ctx.modules[canonical_ref.owner].namespace_object_ref() == Some(canonical_ref);
+  let is_simulated_facade_chunk = if is_module_namespace {
     if include_reason.intersects(SymbolIncludeReason::Normal | SymbolIncludeReason::EntryExport) {
       ctx.module_namespace_included_reason[canonical_ref.owner]
         .insert(ModuleNamespaceIncludedReason::Unknown);
     } else if include_reason.contains(SymbolIncludeReason::ReExportDynamicExports) {
       ctx.module_namespace_included_reason[canonical_ref.owner]
-        .insert(ModuleNamespaceIncludedReason::ReExportExternalModule);
+        .insert(ModuleNamespaceIncludedReason::ReExportDynamicExports);
     }
     include_reason.intersects(SymbolIncludeReason::SimulatedFacadeChunk)
   } else {
@@ -765,16 +835,14 @@ pub fn include_statement(
   module: &NormalModule,
   stmt_info_idx: StmtInfoIdx,
 ) {
-  let is_included = &mut ctx.is_included_vec[module.idx][stmt_info_idx];
-
-  if *is_included {
+  if ctx.is_included_vec[module.idx].has_bit(stmt_info_idx) {
     return;
   }
 
   let stmt_info = module.stmt_infos.get(stmt_info_idx);
 
   // include the statement itself
-  *is_included = true;
+  ctx.is_included_vec[module.idx].set_bit(stmt_info_idx);
 
   // FIXME: bailout for require() import for now
   // it is fine for now, since webpack did not support it either
@@ -798,7 +866,24 @@ pub fn include_statement(
       {
         return;
       }
-      if !module.ast_usage.contains(EcmaModuleAstUsage::IsCjsReexport) {
+      // Skip CJS bailout for dynamic imports that will be determined dead:
+      // top-level pure (unused exports) importing a side-effect-free module.
+      // The dynamic entry mechanism handles CJS bailout for live entries via
+      // `process_and_retain_dynamic_entry`. Without this check, a dead dynamic
+      // import's CJS bailout would mark the module as included while the entry
+      // is later removed, causing an empty-bits assertion in code splitting.
+      if import_record.meta.contains(ImportRecordMeta::TopLevelPureDynamicImport)
+        && !m.side_effects.has_side_effects()
+      {
+        return;
+      }
+      if module.ast_usage.contains(EcmaModuleAstUsage::IsCjsReexport) {
+        // When the importer has multiple CJS re-export targets (conditional re-exports),
+        // bail out to prevent tree-shaking from dropping any branch's exports.
+        if module.ecma_view.cjs_reexport_import_record_ids.len() > 1 {
+          ctx.bailout_cjs_tree_shaking_modules.insert(module_idx);
+        }
+      } else {
         ctx.bailout_cjs_tree_shaking_modules.insert(module_idx);
       }
     });
@@ -825,9 +910,6 @@ pub fn include_statement(
       // Caveat: If we can get the `MemberExprRefResolution` from the `resolved_member_expr_refs`,
       // it means this member expr definitely contains module namespace ref.
       if let Some(resolved_ref) = member_expr_resolution.resolved {
-        let pre = ctx.may_partial_namespace;
-        ctx.may_partial_namespace =
-          member_expr_resolution.target_commonjs_exported_symbol.is_some();
         member_expr_resolution.depended_refs.iter().for_each(|sym_ref| {
           if let Module::Normal(module) = &ctx.modules[sym_ref.owner] {
             module.stmt_infos.declared_stmts_by_symbol(sym_ref).iter().copied().for_each(
@@ -838,11 +920,45 @@ pub fn include_statement(
           }
         });
         include_symbol(ctx, resolved_ref, include_kind);
-        ctx.may_partial_namespace = pre;
+        // When the member expression resolves to a specific CJS export property
+        // (e.g., `ns.x`), we skip the bailout check — we know the access is partial
+        // and CJS tree-shaking can work. Otherwise, the full namespace may be used
+        // opaquely, so we check for bailout.
+        if member_expr_resolution.target_commonjs_exported_symbol.is_none() {
+          check_cjs_bailout(ctx, resolved_ref);
+        }
       } else {
         // If it points to nothing, the expression will be rewritten as `void 0` and there's nothing we need to include
       }
     } else {
+      // For enum member accesses (e.g., `B.member`), check if the member will be inlined
+      // by the finalizer. If so, skip including the enum's declaration — it's dead code
+      // after inlining. This mirrors the `constant_symbol_map` bypass in `include_symbol`.
+      //
+      // This applies to both const and regular enums. The member access will be replaced
+      // by a literal, so the reference no longer needs the declaration. If the enum is
+      // also referenced as a bare symbol (e.g., `typeof E`, `console.log(E)`), that
+      // separate reference will independently include the declaration via `include_symbol`.
+      // Regular enum IIFEs are `@__PURE__`, so they'll be tree-shaken if truly unused.
+      if let SymbolOrMemberExprRef::MemberExpr(member_expr_ref) = reference_ref {
+        let canonical_ref = ctx.symbols.canonical_ref_for(member_expr_ref.object_ref);
+        if let Some(Module::Normal(owner_module)) = ctx.modules.get(canonical_ref.owner) {
+          let symbol_name = canonical_ref.name(ctx.symbols);
+          if let Some(members) = owner_module.ecma_view.enum_member_value_map.get(symbol_name) {
+            // Only bypass for simple member accesses (e.g., `E.member`), not deep chains
+            // like `E.member.something` which wouldn't be inlined.
+            if member_expr_ref.prop_and_span_list.len() == 1 {
+              let prop_name = member_expr_ref.prop_and_span_list.first().map(|p| p.name.as_str());
+              if prop_name.is_some_and(|name| members.contains_key(name)) {
+                // This member access will be inlined — don't include the enum declaration.
+                // Enum inlining is unconditional (not gated by inlineConst mode) because
+                // it implements TypeScript's const enum semantics, which mandate replacement.
+                return;
+              }
+            }
+          }
+        }
+      }
       let original_ref = reference_ref.symbol_ref();
       std::iter::once(original_ref)
         .chain(
@@ -857,7 +973,7 @@ pub fn include_statement(
             );
           }
         });
-      include_symbol(ctx, *original_ref, include_kind);
+      include_symbol_and_check_cjs_bailout(ctx, *original_ref, include_kind);
     }
   });
 }

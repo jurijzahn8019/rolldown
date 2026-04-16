@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use rolldown_common::ExternalModule;
+use rolldown_common::{ExternalModule, NormalModule};
 use rolldown_sourcemap::SourceJoiner;
 
 use crate::{
@@ -74,13 +74,41 @@ pub fn render_chunk_external_imports<'a>(
             ctx.link_output.runtime.resolve_symbol("__toESM"),
             &ctx.chunk.canonical_names,
           );
+          let canonical_ref = ctx.link_output.symbol_db.canonical_ref_for(importee.namespace_ref);
 
-          import_code.push_str(external_module_symbol_name);
-          import_code.push_str(" = ");
-          import_code.push_str(to_esm_fn_name);
-          import_code.push('(');
-          import_code.push_str(external_module_symbol_name);
-          import_code.push_str(");\n");
+          if let Some(node_mode_name) = ctx.chunk.node_mode_external_ns_names.get(&canonical_ref) {
+            // Mixed-mode: emit two __toESM bindings
+            import_code.push_str("let ");
+            import_code.push_str(node_mode_name);
+            import_code.push_str(" = ");
+            import_code.push_str(to_esm_fn_name);
+            import_code.push('(');
+            import_code.push_str(external_module_symbol_name);
+            import_code.push_str(", 1);\n");
+
+            import_code.push_str(external_module_symbol_name);
+            import_code.push_str(" = ");
+            import_code.push_str(to_esm_fn_name);
+            import_code.push('(');
+            import_code.push_str(external_module_symbol_name);
+            import_code.push_str(");\n");
+          } else {
+            // Single-mode: check if any importer is ESM for node-mode flag
+            let is_node_esm = named_imports.iter().any(|(importer_idx, _)| {
+              ctx.link_output.module_table[*importer_idx]
+                .as_normal()
+                .is_some_and(NormalModule::should_consider_node_esm_spec_for_static_import)
+            });
+            import_code.push_str(external_module_symbol_name);
+            import_code.push_str(" = ");
+            import_code.push_str(to_esm_fn_name);
+            import_code.push('(');
+            import_code.push_str(external_module_symbol_name);
+            if is_node_esm {
+              import_code.push_str(", 1");
+            }
+            import_code.push_str(");\n");
+          }
         }
         Some(ExternalImportKind::Used(importee))
       } else if importee.side_effects.has_side_effects() {
@@ -141,4 +169,11 @@ pub fn render_chunk_directives<'a, T: Iterator<Item = &'a &'a str>>(directives: 
     }
   }
   ret
+}
+
+/// Returns `true` if the given directive string is a `"use strict"` directive.
+/// Handles both single-quoted (`'use strict'`) and double-quoted (`"use strict"`) forms,
+/// with or without a trailing semicolon.
+pub fn is_use_strict_directive(s: &str) -> bool {
+  s.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"', ';']) == "use strict"
 }

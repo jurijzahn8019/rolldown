@@ -2,17 +2,19 @@ use oxc::allocator::{GetAddress, UnstableAddress};
 use oxc::{
   ast::{
     AstKind,
-    ast::{self, BindingPattern, Declaration, Expression, IdentifierReference},
+    ast::{
+      self, BindingPattern, Declaration, Expression, IdentifierReference, JSXClosingElement,
+      JSXElementName, JSXMemberExpressionObject, JSXOpeningElement,
+    },
   },
   ast_visit::{Visit, walk},
   semantic::{ScopeFlags, SymbolId},
   span::{GetSpan, Span},
 };
-use rolldown_common::StmtInfoIdx;
 use rolldown_common::{
   ConstExportMeta, EcmaModuleAstUsage, EcmaViewMeta, ImportKind, ImportRecordMeta, LocalExport,
-  MemberExprObjectReferencedType, OutputFormat, RUNTIME_MODULE_KEY, SideEffectDetail, StmtInfoMeta,
-  SymbolRefFlags, dynamic_import_usage::DynamicImportExportsUsage,
+  MemberExprObjectReferencedType, OutputFormat, RUNTIME_MODULE_KEY, SideEffectDetail, StmtInfoIdx,
+  StmtInfoMeta, SymbolRefFlags, dynamic_import_usage::DynamicImportExportsUsage,
 };
 #[cfg(debug_assertions)]
 use rolldown_ecmascript::ToSourceString;
@@ -20,10 +22,10 @@ use rolldown_ecmascript_utils::{ExpressionExt, is_top_level};
 use rolldown_error::BuildDiagnostic;
 use rolldown_std_utils::OptionExt;
 
-use crate::ast_scanner::{TraverseState, cjs_export_analyzer::CommonJsAstType};
+use crate::ast_scanner::cjs_export_analyzer::CommonJsAstType;
 
 use super::{
-  AstScanner, cjs_export_analyzer::CjsGlobalAssignmentType,
+  AstScanner, UntranspiledSyntax, cjs_export_analyzer::CjsGlobalAssignmentType,
   side_effect_detector::SideEffectDetector,
 };
 
@@ -34,12 +36,12 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
     _scope_id: &std::cell::Cell<Option<oxc::semantic::ScopeId>>,
   ) {
     self.scope_stack.push(flags);
-    self.traverse_state.set(TraverseState::TopLevel, is_top_level(&self.scope_stack));
+    self.is_top_level = is_top_level(&self.scope_stack);
   }
 
   fn leave_scope(&mut self) {
     self.scope_stack.pop();
-    self.traverse_state.set(TraverseState::TopLevel, is_top_level(&self.scope_stack));
+    self.is_top_level = is_top_level(&self.scope_stack);
   }
 
   fn enter_node(&mut self, kind: oxc::ast::AstKind<'ast>) {
@@ -48,25 +50,6 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
 
   fn leave_node(&mut self, _it: oxc::ast::AstKind<'ast>) {
     self.visit_path.pop();
-  }
-
-  fn visit_simple_assignment_target(&mut self, it: &ast::SimpleAssignmentTarget<'ast>) {
-    if !self.immutable_ctx.flat_options.property_write_side_effects()
-      && self.traverse_state.contains(TraverseState::TopLevel)
-    {
-      match it {
-        ast::SimpleAssignmentTarget::ComputedMemberExpression(_)
-        | ast::SimpleAssignmentTarget::StaticMemberExpression(_) => {
-          let pre = self.traverse_state;
-          self.traverse_state.insert(TraverseState::RootSymbolReferenceStmtInfoId);
-          walk::walk_simple_assignment_target(self, it);
-          self.traverse_state = pre;
-          return;
-        }
-        _ => {}
-      }
-    }
-    walk::walk_simple_assignment_target(self, it);
   }
 
   fn visit_program(&mut self, program: &ast::Program<'ast>) {
@@ -82,20 +65,23 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
     );
     // Custom visit
 
-    #[expect(
-      clippy::cast_possible_truncation,
-      reason = "We don't have a plan to support more than u32 statements in a single module"
-    )]
     for (idx, stmt) in program.body.iter().enumerate() {
       // `0` is reserved for Module Namespace Object stmt info
-      self.current_stmt_idx = StmtInfoIdx::from_raw_unchecked(idx as u32 + 1);
-      self.current_stmt_info.side_effect = SideEffectDetector::new(
+      #[expect(
+        clippy::cast_possible_truncation,
+        reason = "We don't have a plan to support more than u32 statements in a single module"
+      )]
+      {
+        self.current_stmt_idx = StmtInfoIdx::from_raw_unchecked(idx as u32 + 1);
+      }
+      let detector = SideEffectDetector::new(
         &self.result.symbol_ref_db.ast_scopes,
         self.immutable_ctx.flat_options,
         self.immutable_ctx.options,
         None,
-      )
-      .detect_side_effect_of_stmt(stmt);
+        Some(&self.namespace_object_symbol_ids),
+      );
+      self.current_stmt_info.side_effect = detector.detect_side_effect_of_stmt(stmt);
 
       #[cfg(debug_assertions)]
       {
@@ -111,6 +97,19 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
         self.result.ecma_view_meta.insert(EcmaViewMeta::ExecutionOrderSensitive);
       }
       self.result.stmt_infos.add_stmt_info(std::mem::take(&mut self.current_stmt_info));
+    }
+
+    if self.untranspiled_syntax.contains(UntranspiledSyntax::TypeScript) {
+      self.result.errors.push(BuildDiagnostic::untranspiled_syntax(
+        self.immutable_ctx.id.to_string(),
+        "TypeScript",
+      ));
+    }
+    if self.untranspiled_syntax.contains(UntranspiledSyntax::Jsx) {
+      self
+        .result
+        .errors
+        .push(BuildDiagnostic::untranspiled_syntax(self.immutable_ctx.id.to_string(), "JSX"));
     }
 
     self.result.hashbang_range = program.hashbang.as_ref().map(GetSpan::span);
@@ -150,40 +149,15 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
   }
 
   fn visit_for_of_statement(&mut self, it: &ast::ForOfStatement<'ast>) {
-    let is_top_level_await = it.r#await && self.is_valid_tla_scope();
-    if is_top_level_await && !self.immutable_ctx.flat_options.keep_esm_import_export_syntax() {
-      self.result.errors.push(BuildDiagnostic::unsupported_feature(
-        self.immutable_ctx.id.as_arc_str().clone(),
-        self.immutable_ctx.source.clone(),
-        it.span(),
-        format!(
-          "Top-level await is currently not supported with the '{format}' output format",
-          format = self.immutable_ctx.options.format
-        ),
-      ));
+    if it.r#await && self.is_valid_tla_scope() {
+      self.handle_top_level_await(it.span());
     }
-    if is_top_level_await {
-      self.result.ast_usage.insert(EcmaModuleAstUsage::TopLevelAwait);
-    }
-
     walk::walk_for_of_statement(self, it);
   }
 
   fn visit_await_expression(&mut self, it: &ast::AwaitExpression<'ast>) {
-    let is_top_level_await = self.is_valid_tla_scope();
-    if !self.immutable_ctx.flat_options.keep_esm_import_export_syntax() && is_top_level_await {
-      self.result.errors.push(BuildDiagnostic::unsupported_feature(
-        self.immutable_ctx.id.as_arc_str().clone(),
-        self.immutable_ctx.source.clone(),
-        it.span(),
-        format!(
-          "Top-level await is currently not supported with the '{format}' output format",
-          format = self.immutable_ctx.options.format
-        ),
-      ));
-    }
-    if is_top_level_await {
-      self.result.ast_usage.insert(EcmaModuleAstUsage::TopLevelAwait);
+    if self.is_valid_tla_scope() {
+      self.handle_top_level_await(it.span());
     }
     walk::walk_await_expression(self, it);
   }
@@ -203,7 +177,7 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
 
   fn visit_return_statement(&mut self, stmt: &ast::ReturnStatement<'ast>) {
     // Top-level return statements are only valid in CommonJS modules
-    if self.traverse_state.contains(TraverseState::TopLevel) {
+    if self.is_top_level {
       self.result.ast_usage.insert(EcmaModuleAstUsage::TopLevelReturn);
     }
     walk::walk_return_statement(self, stmt);
@@ -247,10 +221,12 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
             && member_expr.static_property_name() == Some("exports")
           {
             self.cjs_module_ident.get_or_insert(Span::new(id.span.start, id.span.start + 6));
+            // `module.exports = <value>` replaces the entire exports object,
+            // so all prior `exports.xxx` constants are stale.
+            self.has_module_exports_reassignment = true;
           }
           if id.name == "exports" && self.is_global_identifier_reference(id) {
             self.cjs_exports_ident.get_or_insert(Span::new(id.span.start, id.span.start + 7));
-
             if let Some((span, export_name)) = member_expr.static_property_info() {
               // `exports.test = ...`
               let exported_symbol =
@@ -305,7 +281,7 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
       let should_warn = parent
         .as_member_expression_kind()
         .map(|member_expr| {
-          let static_name = member_expr.static_property_name().unwrap_or(ast::Atom::from(""));
+          let static_name = member_expr.static_property_name().unwrap_or(ast::Str::from(""));
           let is_special_property =
             static_name == "url" || static_name == "dirname" || static_name == "filename";
           let format = &self.immutable_ctx.options.format;
@@ -386,22 +362,15 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
 
   fn visit_declaration(&mut self, it: &ast::Declaration<'ast>) {
     match it {
-      Declaration::VariableDeclaration(_) => {
-        walk::walk_declaration(self, it);
-      }
       Declaration::FunctionDeclaration(function) => {
         self.visit_function_decl(function, ScopeFlags::Function);
       }
       Declaration::ClassDeclaration(class) => {
         self.visit_class_decl(class);
       }
-
-      Declaration::TSTypeAliasDeclaration(_)
-      | Declaration::TSInterfaceDeclaration(_)
-      | Declaration::TSEnumDeclaration(_)
-      | Declaration::TSModuleDeclaration(_)
-      | Declaration::TSImportEqualsDeclaration(_)
-      | Declaration::TSGlobalDeclaration(_) => unreachable!(),
+      _ => {
+        walk::walk_declaration(self, it);
+      }
     }
   }
 
@@ -419,9 +388,100 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
     walk::walk_expression(self, it);
   }
 
+  // --- Outermost TS visitor overrides ---
+  // Empty bodies prevent the walker from descending into TS subtrees.
+  // We only record the untranspiled syntax flag so the scan stage can report the error.
+
+  fn visit_ts_enum_declaration(&mut self, _it: &ast::TSEnumDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_type_alias_declaration(&mut self, _it: &ast::TSTypeAliasDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_interface_declaration(&mut self, _it: &ast::TSInterfaceDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_module_declaration(&mut self, _it: &ast::TSModuleDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_import_equals_declaration(&mut self, _it: &ast::TSImportEqualsDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_global_declaration(&mut self, _it: &ast::TSGlobalDeclaration<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_as_expression(&mut self, _it: &ast::TSAsExpression<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_satisfies_expression(&mut self, _it: &ast::TSSatisfiesExpression<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_type_assertion(&mut self, _it: &ast::TSTypeAssertion<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_non_null_expression(&mut self, _it: &ast::TSNonNullExpression<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_instantiation_expression(&mut self, _it: &ast::TSInstantiationExpression<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_export_assignment(&mut self, _it: &ast::TSExportAssignment<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_namespace_export_declaration(
+    &mut self,
+    _it: &ast::TSNamespaceExportDeclaration<'ast>,
+  ) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  fn visit_ts_index_signature(&mut self, _it: &ast::TSIndexSignature<'ast>) {
+    self.untranspiled_syntax |= UntranspiledSyntax::TypeScript;
+  }
+
+  // --- Outermost JSX visitor overrides ---
+
+  fn visit_jsx_element(&mut self, it: &ast::JSXElement<'ast>) {
+    if self.immutable_ctx.flat_options.jsx_preserve() {
+      walk::walk_jsx_element(self, it);
+    } else {
+      self.untranspiled_syntax |= UntranspiledSyntax::Jsx;
+    }
+  }
+
+  fn visit_jsx_fragment(&mut self, it: &ast::JSXFragment<'ast>) {
+    if self.immutable_ctx.flat_options.jsx_preserve() {
+      walk::walk_jsx_fragment(self, it);
+    } else {
+      self.untranspiled_syntax |= UntranspiledSyntax::Jsx;
+    }
+  }
+
   fn visit_call_expression(&mut self, it: &ast::CallExpression<'ast>) {
     self.try_extract_hmr_info_from_hot_accept_call(it);
     walk::walk_call_expression(self, it);
+  }
+
+  fn visit_jsx_opening_element(&mut self, it: &JSXOpeningElement<'ast>) {
+    self.visit_jsx_opening_element_for_jsx_preserve(it);
+    walk::walk_jsx_opening_element(self, it);
+  }
+
+  fn visit_jsx_closing_element(&mut self, it: &JSXClosingElement<'ast>) {
+    self.visit_jsx_closing_element_for_jsx_preserve(it);
+    walk::walk_jsx_closing_element(self, it);
   }
 
   fn visit_export_default_declaration(&mut self, it: &ast::ExportDefaultDeclaration<'ast>) {
@@ -442,6 +502,24 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
 }
 
 impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
+  fn handle_top_level_await(&mut self, span: Span) {
+    if !self.immutable_ctx.flat_options.keep_esm_import_export_syntax() {
+      self.result.errors.push(BuildDiagnostic::unsupported_feature(
+        self.immutable_ctx.id.as_arc_str().clone(),
+        self.immutable_ctx.source.clone(),
+        span,
+        format!(
+          "Top-level await is currently not supported with the '{format}' output format",
+          format = self.immutable_ctx.options.format
+        ),
+      ));
+    }
+    self.result.ast_usage.insert(EcmaModuleAstUsage::TopLevelAwait);
+    if self.result.tla_keyword_span.is_none() {
+      self.result.tla_keyword_span = Some(span);
+    }
+  }
+
   /// visit `Class` of declaration
   #[expect(clippy::unused_self)]
   pub fn get_class_id(&self, class: &ast::Class<'ast>) -> Option<SymbolId> {
@@ -474,7 +552,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
                 self.cjs_named_exports_usage.entry(prop).or_default().write += 1;
               }
               Some(CommonJsAstType::EsModuleFlag) => {}
-              Some(CommonJsAstType::Reexport) => {
+              Some(CommonJsAstType::Reexport(_)) => {
                 // This is only usd for `module.exports = require('mod')`
                 // should only reached when `ident_ref` is `module`
                 unreachable!()
@@ -484,7 +562,7 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
               }
               None => match self.try_extract_parent_static_member_expr_chain(1) {
                 Some((_span, prop)) => {
-                  self.cjs_named_exports_usage.entry(prop[0].0.clone()).or_default().read += 1;
+                  self.cjs_named_exports_usage.entry(prop[0].name.clone()).or_default().read += 1;
                 }
                 _ => {
                   self.result.ast_usage.insert(EcmaModuleAstUsage::UnknownExportsRead);
@@ -518,6 +596,8 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
         self.process_global_identifier_ref_by_ancestor(ident_ref);
       }
       super::IdentifierReferenceKind::Root(root_symbol_id) => {
+        let is_member_write = self.is_member_write_target(ident_ref);
+
         // if the identifier_reference is a NamedImport MemberExpr access, we store it as a `MemberExpr`
         // use this flag to avoid insert it as `Symbol` at the same time.
         let mut is_inserted_before = false;
@@ -540,21 +620,47 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           {
             if !span.is_unspanned() {
               is_inserted_before = true;
+
+              if matches!(ty, MemberExprObjectReferencedType::Namespace)
+                && is_member_write
+                && props[0].name == "default"
+              {
+                // Write through namespace default (e.g. `ns.default.a = value`). Since
+                // `ns.default` is the raw CJS exports object, any property write on it may
+                // affect all `ns.xxx` reads. Mark the symbol so all CJS exports of the target
+                // module are bailed out from constant inlining.
+                let symbol_ref_flags = root_symbol_id.flags_mut(&mut self.result.symbol_ref_db);
+                *symbol_ref_flags |= SymbolRefFlags::HasComputedMemberWrite;
+              }
               self.add_member_expr_reference(
                 root_symbol_id,
                 props,
                 span,
                 ty,
                 ident_ref.reference_id.get(),
+                is_member_write,
               );
             }
+          } else if is_member_write
+            && matches!(
+              ty,
+              MemberExprObjectReferencedType::Default | MemberExprObjectReferencedType::Namespace
+            )
+          {
+            // Computed member write (e.g. `cjs[name] = value`) where the key is dynamic.
+            // Mark the import symbol so all CJS exports of the target module won't be inlined.
+            let symbol_ref_flags = root_symbol_id.flags_mut(&mut self.result.symbol_ref_db);
+            *symbol_ref_flags |= SymbolRefFlags::HasComputedMemberWrite;
           }
         }
         if !is_inserted_before {
           self.add_referenced_symbol(root_symbol_id);
         }
 
-        if self.traverse_state.contains(TraverseState::RootSymbolReferenceStmtInfoId) {
+        if is_member_write
+          && !self.immutable_ctx.flat_options.property_write_side_effects()
+          && self.is_top_level
+        {
           // Since `0` is always namespace object stmt info
           self
             .result
@@ -571,6 +677,9 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
           _ => {}
         }
 
+        // For JSX preserve mode, mark symbols used as JSX element names.
+        // This flag ensures that after bundling, JSX element names whose canonical
+        // name starts with lowercase get uppercased to remain valid component references.
         if self.immutable_ctx.flat_options.jsx_preserve()
           && self.visit_path.last().is_some_and(|ast_kind| {
             matches!(ast_kind, AstKind::JSXOpeningElement(_) | AstKind::JSXClosingElement(_))
@@ -590,7 +699,10 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
   ) -> Option<()> {
     let parent = self.visit_path.last()?;
     if let AstKind::CallExpression(call_expr) = parent {
-      if ident_ref.name == "eval" && call_expr.callee.address() == ident_ref.unstable_address() {
+      if ident_ref.name == "eval"
+        && !call_expr.optional
+        && call_expr.callee.address() == ident_ref.unstable_address()
+      {
         // TODO: esbuild track has_eval for each scope, this could reduce bailout range, and may
         // improve treeshaking performance. https://github.com/evanw/esbuild/blob/360d47230813e67d0312ad754cad2b6ee09b151b/internal/js_ast/js_ast.go#L1288-L1291
         self.result.ecma_view_meta.insert(EcmaViewMeta::Eval);
@@ -660,5 +772,55 @@ impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
     let id = self.add_import_record(value.as_ref(), ImportKind::Require, span, init_meta, None);
     self.result.imports.insert(expr.span, id);
     true
+  }
+
+  /// For JSX preserve mode, mark the root identifier of JSXElementName::MemberExpression.
+  /// Uses `UsedAsJSXMemberExprRoot` (not `MustStartWithCapitalLetterForJSX`) because
+  /// member expressions like `<obj.Foo>` are valid JSX regardless of root casing.
+  /// Only facade (generated) symbols need uppercasing (e.g. `import_react` → `Import_react`).
+  fn mark_jsx_member_expression_root(&mut self, element_name: &JSXElementName<'ast>) {
+    if !self.immutable_ctx.flat_options.jsx_preserve() {
+      return;
+    }
+
+    // Only handle MemberExpression case. IdentifierReference case is handled
+    // in visit_identifier_reference where the parent is JSXOpeningElement/JSXClosingElement.
+    let JSXElementName::MemberExpression(member_expr) = element_name else {
+      return;
+    };
+
+    // Get the root identifier of the member expression chain (e.g., `ns` in `<ns.Foo.Bar>`)
+    let mut current = &member_expr.object;
+    loop {
+      match current {
+        JSXMemberExpressionObject::IdentifierReference(ident_ref) => {
+          if let Some(symbol_id) = self.resolve_symbol_from_reference(ident_ref) {
+            if self.is_root_symbol(symbol_id) {
+              let symbol_ref: rolldown_common::SymbolRef =
+                (self.immutable_ctx.idx, symbol_id).into();
+              let symbol_ref_flags = symbol_ref.flags_mut(&mut self.result.symbol_ref_db);
+              *symbol_ref_flags |= SymbolRefFlags::UsedAsJSXMemberExprRoot;
+            }
+          }
+          break;
+        }
+        JSXMemberExpressionObject::MemberExpression(nested_member) => {
+          current = &nested_member.object;
+        }
+        JSXMemberExpressionObject::ThisExpression(_) => {
+          break;
+        }
+      }
+    }
+  }
+}
+
+impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
+  fn visit_jsx_opening_element_for_jsx_preserve(&mut self, elem: &JSXOpeningElement<'ast>) {
+    self.mark_jsx_member_expression_root(&elem.name);
+  }
+
+  fn visit_jsx_closing_element_for_jsx_preserve(&mut self, elem: &JSXClosingElement<'ast>) {
+    self.mark_jsx_member_expression_root(&elem.name);
   }
 }

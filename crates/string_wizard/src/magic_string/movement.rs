@@ -1,21 +1,37 @@
-use crate::MagicString;
-
-use super::update::UpdateOptions;
+use crate::{MagicString, chunk::EditOptions};
 
 impl MagicString<'_> {
-  pub fn remove(&mut self, start: usize, end: usize) -> Result<&mut Self, String> {
-    self.inner_update_with(
-      start,
-      end,
-      "".into(),
-      UpdateOptions { keep_original: false, overwrite: true },
-      false,
-    )
+  /// Removes characters in the range `[start, end)` from the generated output.
+  ///
+  /// Unlike `update`/`overwrite`, this iterates by original position (via `chunk_by_start`)
+  /// rather than by linked-list order, so it works correctly across moved content.
+  pub fn remove(&mut self, start: u32, end: u32) -> Result<&mut Self, String> {
+    if start == end {
+      return Ok(self);
+    }
+    if start > end {
+      return Err(format!("end must be greater than start, got start: {start}, end: {end}"));
+    }
+
+    self.split_at(start)?;
+    self.split_at(end)?;
+
+    let mut chunk_idx = self.chunk_by_start.get(&start).copied();
+
+    while let Some(idx) = chunk_idx {
+      let chunk = &mut self.chunks[idx];
+      let chunk_end = chunk.end();
+      chunk.edit("".into(), EditOptions { overwrite: true, store_name: false });
+
+      chunk_idx = if end > chunk_end { self.chunk_by_start.get(&chunk_end).copied() } else { None };
+    }
+
+    Ok(self)
   }
 
   /// Moves the characters from start and end to index. Returns this.
   // `move` is reserved keyword in Rust, so we use `relocate` instead.
-  pub fn relocate(&mut self, start: usize, end: usize, to: usize) -> Result<&mut Self, String> {
+  pub fn relocate(&mut self, start: u32, end: u32, to: u32) -> Result<&mut Self, String> {
     if to >= start && to <= end {
       return Err("Cannot move a selection inside itself".to_string());
     }
@@ -84,12 +100,12 @@ impl MagicString<'_> {
 
   /// Returns a clone with content outside the specified range removed.
   /// This is equivalent to `clone().remove(0, start).remove(end, original.len())`.
-  pub fn snip(&self, start: usize, end: usize) -> Result<Self, String> {
+  pub fn snip(&self, start: u32, end: u32) -> Result<Self, String> {
     let mut clone = self.clone();
     if start > 0 {
       clone.remove(0, start)?;
     }
-    let original_len = self.source.len();
+    let original_len = self.source.len() as u32;
     if end < original_len {
       clone.remove(end, original_len)?;
     }

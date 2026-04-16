@@ -33,7 +33,7 @@ export default defineTest({
       [
         "assets/sanitized-+emitted-C6bBH0W1.txt",
         "assets/sanitized-asset-BIR0xpQL",
-        "sanitized-dynamic-B5x-7dgY.js",
+        "sanitized-dynamic-DVinTJUZ.js",
         "sanitized-main.js",
       ]
     `);

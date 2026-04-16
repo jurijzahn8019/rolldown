@@ -73,7 +73,7 @@ pub fn json_value_to_expression<'a>(
       builder.expression_numeric_literal(SPAN, f, None, oxc::ast::ast::NumberBase::Decimal)
     }
 
-    Value::String(s) => builder.expression_string_literal(SPAN, builder.atom(s), None),
+    Value::String(s) => builder.expression_string_literal(SPAN, builder.str(s), None),
 
     Value::Array(arr) => {
       let elements = builder.vec_from_iter(arr.iter().map(|item| {
@@ -85,7 +85,7 @@ pub fn json_value_to_expression<'a>(
 
     Value::Object(obj) => {
       let properties = builder.vec_from_iter(obj.iter().map(|(key, val)| {
-        let key_expr = builder.expression_string_literal(SPAN, builder.atom(key), None);
+        let key_expr = builder.expression_string_literal(SPAN, builder.str(key), None);
         let value_expr = json_value_to_expression(val, builder);
 
         builder.object_property_kind_object_property(
@@ -169,6 +169,24 @@ mod tests {
     assert_snapshot!(to_code(&serde_json::json!({"true": 1})), @r#"({ "true": 1 });"#);
     // Note: serde_json deduplicates keys, keeping the last value
     assert_snapshot!(to_code(&serde_json::from_str::<Value>(r#"{"a": 1, "a": 2}"#).unwrap()), @r#"({ "a": 2 });"#);
+  }
+
+  /// Regression test for https://github.com/vitejs/vite/issues/21982
+  #[test]
+  fn test_float_17_significant_digits() {
+    let inputs = [
+      114.351_437_992_579_97_f64,
+      406.314_867_132_489_95_f64,
+      163.414_980_184_984_98_f64,
+      364.094_987_249_009_9_f64,
+    ];
+    let json: Value = serde_json::from_str(
+      r"[114.35143799257997, 406.31486713248995, 163.41498018498498, 364.09498724900986]",
+    )
+    .unwrap();
+    let code: String = to_code(&json).chars().filter(|c| !c.is_whitespace()).collect();
+    let expected = format!("[{}];", inputs.map(|v| v.to_string()).join(","));
+    assert_eq!(code, expected);
   }
 
   #[test]

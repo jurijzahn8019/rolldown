@@ -74,47 +74,16 @@ impl DevEngine {
       debounce_delay: ctx.options.debounce_duration,
       compare_contents_for_polling: ctx.options.compare_contents_for_polling,
       debounce_tick_rate: ctx.options.debounce_tick_rate,
+      use_polling: ctx.options.use_polling,
+      use_debounce: ctx.options.use_debounce,
     };
 
     let event_handler = BundleCoordinator::create_watcher_event_handler(coordinator_tx.clone());
 
-    let watcher = {
-      if ctx.options.disable_watcher {
-        NoopFsWatcher::with_config(event_handler, watcher_config)?.into_dyn_fs_watcher()
-      } else {
-        #[cfg(not(target_family = "wasm"))]
-        {
-          use rolldown_fs_watcher::{
-            DebouncedPollFsWatcher, DebouncedRecommendedFsWatcher, PollFsWatcher,
-            RecommendedFsWatcher,
-          };
-
-          match (ctx.options.use_polling, ctx.options.use_debounce) {
-            // Polling + no debounce = PollFsWatcher
-            (true, false) => {
-              PollFsWatcher::with_config(event_handler, watcher_config)?.into_dyn_fs_watcher()
-            }
-            // Polling + debounce = DebouncedPollFsWatcher
-            (true, true) => DebouncedPollFsWatcher::with_config(event_handler, watcher_config)?
-              .into_dyn_fs_watcher(),
-            // No polling + no debounce = RecommendedFsWatcher
-            (false, false) => RecommendedFsWatcher::with_config(event_handler, watcher_config)?
-              .into_dyn_fs_watcher(),
-            // No polling + debounce = DebouncedRecommendedFsWatcher
-            (false, true) => {
-              DebouncedRecommendedFsWatcher::with_config(event_handler, watcher_config)?
-                .into_dyn_fs_watcher()
-            }
-          }
-        }
-        #[cfg(target_family = "wasm")]
-        {
-          use rolldown_fs_watcher::RecommendedFsWatcher;
-          // For WASM, always use NotifyWatcher (which is PollWatcher in WASM)
-          // Use the FsWatcher trait implementation
-          RecommendedFsWatcher::with_config(event_handler, watcher_config)?.into_dyn_fs_watcher()
-        }
-      }
+    let watcher = if ctx.options.disable_watcher {
+      NoopFsWatcher::with_config(event_handler, watcher_config)?.into_dyn_fs_watcher()
+    } else {
+      rolldown_fs_watcher::create_fs_watcher(event_handler, watcher_config)?
     };
 
     let coordinator =
@@ -263,21 +232,22 @@ impl DevEngine {
     first_invalidated_by: Option<String>,
   ) -> BuildResult<Vec<ClientHmrUpdate>> {
     self.create_error_if_closed()?;
+    let mut bundler = self.bundler.lock().await;
 
     // Use bundler directly for invalidation (avoid message roundtrip)
     let mut updates = Vec::new();
-    for client in self.clients.iter() {
-      let mut bundler = self.bundler.lock().await;
+    let clients = self.clients.lock().await;
+    for (client_key, client) in clients.iter() {
       let update = bundler
         .compute_update_for_calling_invalidate(
           caller.clone(),
           first_invalidated_by.clone(),
-          client.key(),
+          client_key,
           &client.executed_modules,
           Arc::clone(&self.next_invalidate_patch_id),
         )
         .await?;
-      updates.push(ClientHmrUpdate { client_id: client.key().clone(), update });
+      updates.push(ClientHmrUpdate { client_id: client_key.clone(), update });
     }
 
     Ok(updates)
@@ -306,15 +276,20 @@ impl DevEngine {
     client_id: String,
   ) -> BuildResult<String> {
     self.create_error_if_closed()?;
+    let mut bundler = self.bundler.lock().await;
 
     // Get executed modules for this client
-    let executed_modules =
-      self.clients.get(&client_id).map(|c| c.executed_modules.clone()).unwrap_or_default();
+    let executed_modules = self
+      .clients
+      .lock()
+      .await
+      .get(&client_id)
+      .map(|c| c.executed_modules.clone())
+      .unwrap_or_default();
 
     // Mark the proxy module as fetched BEFORE compilation.
     // This changes the content returned by the lazy compilation plugin's load hook
     // from a stub (fetches via /lazy endpoint) to actual code that imports the real module.
-    let mut bundler = self.bundler.lock().await;
     if let Some(lazy_ctx) = &bundler.lazy_compilation_context {
       lazy_ctx.mark_as_fetched(&proxy_module_id);
     }
@@ -356,9 +331,14 @@ impl DevEngine {
       .map_err_to_unhandleable()
       .context("DevEngine: failed to send Close message to coordinator - coordinator may have already terminated")?;
 
-    // Close the bundler
-    let mut bundler = self.bundler.lock().await;
-    bundler.close().await?;
+    // Close the bundler (calls `closeBundle` plugin hook).
+    // The bundler lock MUST be released before waiting for the coordinator below.
+    // Otherwise we'd deadlock: the coordinator's Close handler waits for any running
+    // bundling task to finish, and that task may need to acquire the bundler lock.
+    {
+      let mut bundler = self.bundler.lock().await;
+      bundler.close().await?;
+    }
 
     // Wait for coordinator to close (coordinator handles watcher cleanup)
     let coordinator_state = self.coordinator_state.lock().await;
@@ -434,11 +414,11 @@ impl DevEngine {
   }
 
   #[cfg(feature = "testing")]
-  pub fn create_client_for_testing(&self) {
+  pub async fn create_client_for_testing(&self) {
     let client_session = ClientSession::default();
     // Use special client ID "rolldown-tests" which will be recognized by HMR logic
     // to always consider modules as executed, without needing to populate the HashSet
-    self.clients.insert("rolldown-tests".to_string(), client_session);
+    self.clients.lock().await.insert("rolldown-tests".to_string(), client_session);
   }
 
   fn create_error_if_closed(&self) -> BuildResult<()> {

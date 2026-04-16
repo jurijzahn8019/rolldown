@@ -6,21 +6,10 @@ source: crates/rolldown_testing/src/integration_test.rs
 ## main.js
 
 ```js
-// HIDDEN [rolldown:runtime]
-//#region foo.js
-var foo;
-var init_foo = __esmMin((async () => {
-	await 1e3;
-	foo = 123;
-}));
-
-//#endregion
-//#region main.js
-var init_main = __esmMin((async () => {
+// HIDDEN [\0rolldown/runtime.js]
+await __esmMin((async () => {
 	await init_foo();
-	console.log(foo);
-}));
+	console.log(123);
+}))();
 
-//#endregion
-await init_main();
 ```

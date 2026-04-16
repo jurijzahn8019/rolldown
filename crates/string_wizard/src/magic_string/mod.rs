@@ -24,19 +24,21 @@ use crate::{
 #[derive(Debug, Default)]
 pub struct MagicStringOptions {
   pub filename: Option<String>,
+  pub ignore_list: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MagicString<'s> {
   filename: Option<String>,
+  ignore_list: bool,
   intro: VecDeque<CowStr<'s>>,
   outro: VecDeque<CowStr<'s>>,
   source: Cow<'s, str>,
   chunks: IndexChunks<'s>,
   first_chunk_idx: ChunkIdx,
   last_chunk_idx: ChunkIdx,
-  chunk_by_start: FxHashMap<usize, ChunkIdx>,
-  chunk_by_end: FxHashMap<usize, ChunkIdx>,
+  chunk_by_start: FxHashMap<u32, ChunkIdx>,
+  chunk_by_end: FxHashMap<u32, ChunkIdx>,
   guessed_indentor: OnceLock<String>,
 
   // This is used to speed up the search for the chunk that contains a given index.
@@ -56,7 +58,11 @@ impl<'text> MagicString<'text> {
 
   pub fn with_options(source: impl Into<Cow<'text, str>>, options: MagicStringOptions) -> Self {
     let source = source.into();
-    let source_len = source.len();
+    debug_assert!(
+      source.len() <= u32::MAX as usize,
+      "MagicString does not support sources larger than 4GB"
+    );
+    let source_len = source.len() as u32;
     let initial_chunk = Chunk::new(Span(0, source_len));
     let mut chunks = IndexChunks::with_capacity(1);
     let initial_chunk_idx = chunks.push(initial_chunk);
@@ -70,6 +76,7 @@ impl<'text> MagicString<'text> {
       chunk_by_start: Default::default(),
       chunk_by_end: Default::default(),
       filename: options.filename,
+      ignore_list: options.ignore_list,
       guessed_indentor: OnceLock::default(),
       last_searched_chunk_idx: initial_chunk_idx,
     };
@@ -88,12 +95,21 @@ impl<'text> MagicString<'text> {
     self.filename.as_deref()
   }
 
-  pub fn len(&self) -> usize {
-    self.fragments().map(|f| f.len()).sum()
+  pub fn ignore_list(&self) -> bool {
+    self.ignore_list
   }
 
+  /// Returns the length of the content within chunks (intro + content + outro per chunk),
+  /// excluding the global intro/outro from `prepend`/`append`.
+  /// This aligns with the reference `magic-string` behavior.
+  pub fn len(&self) -> usize {
+    self.iter_chunks().flat_map(|c| c.fragments(&self.source)).map(|f| f.len()).sum()
+  }
+
+  /// Returns `true` if all chunk content (intro + content + outro) is whitespace or empty.
+  /// This aligns with the reference `magic-string` behavior where `isEmpty()` uses `.trim()`.
   pub fn is_empty(&self) -> bool {
-    self.len() == 0
+    self.iter_chunks().flat_map(|c| c.fragments(&self.source)).all(|f| f.trim().is_empty())
   }
 
   /// Indicates if the string has been changed.
@@ -105,7 +121,7 @@ impl<'text> MagicString<'text> {
   pub fn last_char(&self) -> Option<char> {
     // Check outro first (last in output order)
     if let Some(last_outro) = self.outro.back()
-      && let Some(c) = last_outro.chars().last()
+      && let Some(c) = last_outro.chars().next_back()
     {
       return Some(c);
     }
@@ -117,7 +133,7 @@ impl<'text> MagicString<'text> {
 
       // Check chunk outro
       if let Some(last_outro) = chunk.outro.back()
-        && let Some(c) = last_outro.chars().last()
+        && let Some(c) = last_outro.chars().next_back()
       {
         return Some(c);
       }
@@ -128,13 +144,13 @@ impl<'text> MagicString<'text> {
         .as_ref()
         .map(|s| s.as_ref())
         .unwrap_or_else(|| chunk.span.text(&self.source));
-      if let Some(c) = content.chars().last() {
+      if let Some(c) = content.chars().next_back() {
         return Some(c);
       }
 
       // Check chunk intro
       if let Some(last_intro) = chunk.intro.back()
-        && let Some(c) = last_intro.chars().last()
+        && let Some(c) = last_intro.chars().next_back()
       {
         return Some(c);
       }
@@ -144,7 +160,7 @@ impl<'text> MagicString<'text> {
 
     // Check intro last (first in output order, but we're going backwards)
     if let Some(last_intro) = self.intro.back()
-      && let Some(c) = last_intro.chars().last()
+      && let Some(c) = last_intro.chars().next_back()
     {
       return Some(c);
     }
@@ -219,11 +235,11 @@ impl<'text> MagicString<'text> {
     self.outro.push_back(content.into());
   }
 
-  fn prepend_outro(&mut self, content: impl Into<CowStr<'text>>) {
+  pub fn prepend_outro(&mut self, content: impl Into<CowStr<'text>>) {
     self.outro.push_front(content.into());
   }
 
-  fn append_intro(&mut self, content: impl Into<CowStr<'text>>) {
+  pub fn append_intro(&mut self, content: impl Into<CowStr<'text>>) {
     self.intro.push_back(content.into());
   }
 
@@ -248,8 +264,11 @@ impl<'text> MagicString<'text> {
   ///
   /// Chunk{span: (0, 3)} => "abc"
   /// Chunk{span: (3, 7)} => "defg"
-  fn split_at(&mut self, at_index: usize) -> Result<(), String> {
-    if at_index == 0 || at_index >= self.source.len() || self.chunk_by_end.contains_key(&at_index) {
+  fn split_at(&mut self, at_index: u32) -> Result<(), String> {
+    if at_index == 0
+      || (at_index as usize) >= self.source.len()
+      || self.chunk_by_end.contains_key(&at_index)
+    {
       return Ok(());
     }
 
@@ -296,8 +315,8 @@ impl<'text> MagicString<'text> {
     Ok(())
   }
 
-  fn by_start_mut(&mut self, text_index: usize) -> Result<Option<&mut Chunk<'text>>, String> {
-    if text_index == self.source.len() {
+  fn by_start_mut(&mut self, text_index: u32) -> Result<Option<&mut Chunk<'text>>, String> {
+    if text_index as usize == self.source.len() {
       Ok(None)
     } else {
       self.split_at(text_index)?;
@@ -306,7 +325,7 @@ impl<'text> MagicString<'text> {
     }
   }
 
-  fn by_end_mut(&mut self, text_index: usize) -> Result<Option<&mut Chunk<'text>>, String> {
+  fn by_end_mut(&mut self, text_index: u32) -> Result<Option<&mut Chunk<'text>>, String> {
     if text_index == 0 {
       Ok(None)
     } else {
@@ -320,7 +339,7 @@ impl<'text> MagicString<'text> {
 #[expect(clippy::to_string_trait_impl)] // `impl Display` causes extra allocation
 impl ToString for MagicString<'_> {
   fn to_string(&self) -> String {
-    let size_hint = self.len();
+    let size_hint = self.fragments().map(|f| f.len()).sum();
     let mut ret = String::with_capacity(size_hint);
     self.fragments().for_each(|f| ret.push_str(f));
     ret

@@ -1,7 +1,7 @@
 use oxc::semantic::SymbolId;
 use rolldown_std_utils::OptionExt;
 
-use crate::{IndexModules, Module, ModuleIdx, SymbolRefDb, SymbolRefFlags};
+use crate::{EcmaViewMeta, IndexModules, Module, ModuleIdx, SymbolRefDb, SymbolRefFlags};
 
 use super::symbol_ref_db::{GetLocalDb, GetLocalDbMut};
 
@@ -37,11 +37,8 @@ impl SymbolRef {
     db.local_db_mut(self.owner).flags.entry(self.symbol).or_default()
   }
 
-  // `None` means we don't know if it's declared by `const`.
-  pub fn is_declared_by_const(&self, db: &SymbolRefDb) -> Option<bool> {
-    let flags = self.flags(db)?;
-    // Not having this flag means we don't know if it's declared by `const` instead of it's not declared by `const`.
-    flags.contains(SymbolRefFlags::IsConst).then_some(true)
+  pub fn is_declared_by_const(&self, db: &SymbolRefDb) -> bool {
+    db.local_db(self.owner).ast_scopes.scoping().symbol_flags(self.symbol).is_const_variable()
   }
 
   /// `None` means we don't know if it gets reassigned.
@@ -49,6 +46,16 @@ impl SymbolRef {
     let flags = self.flags(db)?;
     // Not having this flag means we don't know
     flags.contains(SymbolRefFlags::IsNotReassigned).then_some(true)
+  }
+
+  pub fn is_side_effect_free_function(&self, db: &SymbolRefDb, modules: &IndexModules) -> bool {
+    let Some(normal_module) = modules[self.owner].as_normal() else {
+      return false;
+    };
+    if !normal_module.meta.contains(EcmaViewMeta::TopExportedSideEffectsFreeFunction) {
+      return false;
+    }
+    self.flags(db).is_some_and(|flag| flag.contains(SymbolRefFlags::SideEffectsFreeFunction))
   }
 
   pub fn is_declared_in_root_scope(&self, db: &SymbolRefDb) -> bool {

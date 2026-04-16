@@ -5,13 +5,12 @@ use super::GenerateStage;
 use crate::chunk_graph::ChunkGraph;
 use crate::utils::chunk::normalize_preserve_entry_signature;
 use itertools::{Itertools, multizip};
-use oxc::semantic::SymbolId;
-use oxc::span::CompactStr;
 use oxc_index::{IndexVec, index_vec};
+use oxc_str::CompactStr;
 use rolldown_common::{
   ChunkIdx, ChunkKind, ChunkMeta, CrossChunkImportItem, EntryPointKind, ExportsKind, ImportKind,
   ImportRecordMeta, Module, ModuleIdx, NamedImport, OutputFormat, PostChunkOptimizationOperation,
-  PreserveEntrySignatures, RUNTIME_HELPER_NAMES, SymbolIdExt, SymbolRef, WrapKind,
+  PreserveEntrySignatures, RUNTIME_HELPER_NAMES, SymbolRef, WrapKind,
 };
 use rolldown_utils::concat_string;
 use rolldown_utils::index_vec_ext::IndexVecRefExt as _;
@@ -225,7 +224,7 @@ impl GenerateStage<'_> {
               }
             });
           module.stmt_infos.iter_enumerated().for_each(|(stmt_info_idx, stmt_info)| {
-            if !self.link_output.metas[module.idx].stmt_info_included[stmt_info_idx] {
+            if !self.link_output.metas[module.idx].stmt_info_included.has_bit(stmt_info_idx) {
               return;
             }
             stmt_info.declared_symbols.iter().for_each(|declared| {
@@ -235,23 +234,14 @@ impl GenerateStage<'_> {
             stmt_info.referenced_symbols.iter().for_each(|reference_ref| {
               match reference_ref {
                 rolldown_common::SymbolOrMemberExprRef::Symbol(referenced) => {
-                  let mut canonical_ref = symbols.canonical_ref_for(*referenced);
-                  if let Some(namespace_alias) = &symbols.get(canonical_ref).namespace_alias {
-                    canonical_ref = namespace_alias.namespace_ref;
-                  }
-                  depended_symbols.insert(canonical_ref);
+                  depended_symbols.insert(symbols.canonical_ref_resolving_namespace(*referenced));
                 }
                 rolldown_common::SymbolOrMemberExprRef::MemberExpr(member_expr) => {
                   match member_expr.represent_symbol_ref(
                     &self.link_output.metas[module.idx].resolved_member_expr_refs,
                   ) {
                     Some(sym_ref) => {
-                      let mut canonical_ref = self.link_output.symbol_db.canonical_ref_for(sym_ref);
-                      let symbol = symbols.get(canonical_ref);
-                      if let Some(ref ns_alias) = symbol.namespace_alias {
-                        canonical_ref = ns_alias.namespace_ref;
-                      }
-                      depended_symbols.insert(canonical_ref);
+                      depended_symbols.insert(symbols.canonical_ref_resolving_namespace(sym_ref));
                     }
                     _ => {
                       // `None` means the member expression resolve to a ambiguous export, which means it actually resolve to nothing.
@@ -271,17 +261,15 @@ impl GenerateStage<'_> {
           if !matches!(entry_meta.wrap_kind(), WrapKind::Cjs) {
             for export_ref in entry_meta
               .resolved_exports
-              .values()
+              .iter()
+              .sorted_by_key(|(name, _)| *name)
+              .map(|(_, export)| export)
               // A chunk should always consume a cjs export symbol by property access, so filter
               // out a exported symbol that came from a cjs module.
-              .filter(|resolved_export| !resolved_export.came_from_cjs)
+              .filter(|resolved_export| !resolved_export.came_from_commonjs)
             {
-              let mut canonical_ref = symbols.canonical_ref_for(export_ref.symbol_ref);
-              let symbol = symbols.get(canonical_ref);
-              if let Some(ns_alias) = &symbol.namespace_alias {
-                canonical_ref = ns_alias.namespace_ref;
-              }
-              depended_symbols.insert(canonical_ref);
+              depended_symbols
+                .insert(symbols.canonical_ref_resolving_namespace(export_ref.symbol_ref));
             }
           }
 
@@ -420,16 +408,18 @@ impl GenerateStage<'_> {
                     if let Some(wrapper_ref) = meta.wrapper_ref {
                       index_chunk_exported_symbols[chunk_id].entry(wrapper_ref).or_default();
                     }
-                    index_chunk_exported_symbols[chunk_id]
-                      .entry(SymbolId::module_namespace_symbol_ref(*dynamic_entry_module))
-                      .or_default();
+                    let ns_ref = self.link_output.module_table[*dynamic_entry_module]
+                      .namespace_object_ref()
+                      .expect("dynamic entry should be normal module");
+                    index_chunk_exported_symbols[chunk_id].entry(ns_ref).or_default();
                   }
                   WrapKind::None => {
                     // For non-wrapped modules, export only namespace
                     // Generated code: `import('./chunk.js').then((n) => n.namespace)`
-                    index_chunk_exported_symbols[chunk_id]
-                      .entry(SymbolId::module_namespace_symbol_ref(*dynamic_entry_module))
-                      .or_default();
+                    let ns_ref = self.link_output.module_table[*dynamic_entry_module]
+                      .namespace_object_ref()
+                      .expect("dynamic entry should be normal module");
+                    index_chunk_exported_symbols[chunk_id].entry(ns_ref).or_default();
                   }
                 }
               }
@@ -489,8 +479,18 @@ impl GenerateStage<'_> {
           }
         }
 
-        // If this is an entry point, make sure we import all chunks belonging to this entry point, even if there are no imports. We need to make sure these chunks are evaluated for their side effects too.
-        if let ChunkKind::EntryPoint { bit: importer_chunk_bit, .. } = &chunk.kind {
+        if let ChunkKind::EntryPoint { module: entry_module_idx, .. } = &chunk.kind {
+          // If the entry module is in a different chunk (facade entry), ensure that chunk
+          // is imported. Without this, the facade would be empty and the entry module's
+          // code would never execute.
+          if let Some(entry_chunk_idx) = chunk_graph.module_to_chunk[*entry_module_idx] {
+            if entry_chunk_idx != chunk_id {
+              index_cross_chunk_imports[chunk_id].insert(entry_chunk_idx);
+              let imports_from_other_chunks = &mut index_imports_from_other_chunks[chunk_id];
+              imports_from_other_chunks.entry(entry_chunk_idx).or_default();
+            }
+          }
+
           if self.options.preserve_modules {
             let entry_module =
               chunk.entry_module(&self.link_output.module_table).expect("Should have entry module");
@@ -510,23 +510,58 @@ impl GenerateStage<'_> {
                 let imports_from_other_chunks = &mut index_imports_from_other_chunks[chunk_id];
                 imports_from_other_chunks.entry(importee_chunk_idx).or_default();
               });
-          } else if !self.options.is_strict_execution_order_enabled() {
-            // With strict_execution_order/wrapping, modules aren't executed in loading but on-demand.
-            // So we don't need to do plain imports to address the side effects. It would be ensured
-            // by those `init_xxx()` calls.
-            chunk_graph
-              .chunk_table
-              .iter_enumerated()
-              .filter(|(id, _)| *id != chunk_id)
-              .filter(|(_, importee_chunk)| {
-                importee_chunk.bits.has_bit(*importer_chunk_bit)
-                  && importee_chunk.has_side_effect(&self.link_output.module_table)
-              })
-              .for_each(|(importee_chunk_id, _)| {
-                index_cross_chunk_imports[chunk_id].insert(importee_chunk_id);
-                let imports_from_other_chunks = &mut index_imports_from_other_chunks[chunk_id];
-                imports_from_other_chunks.entry(importee_chunk_id).or_default();
-              });
+          }
+        }
+
+        // Add bare imports for side-effectful dependencies in other chunks.
+        //
+        // With strict_execution_order/wrapping, modules aren't executed in loading but on-demand.
+        // So we don't need to do plain imports to address the side effects. It would be ensured
+        // by those `init_xxx()` calls.
+        if !self.options.is_strict_execution_order_enabled() {
+          for &module_idx in &chunk.modules {
+            let Some(module) = self.link_output.module_table[module_idx].as_normal() else {
+              continue;
+            };
+
+            // From import records.
+            // This adds side-effectful imports as bare imports if necessary.
+            for rec in &module.import_records {
+              if rec.kind != ImportKind::Import {
+                continue;
+              }
+              let Some(importee_module_idx) = rec.resolved_module else {
+                continue;
+              };
+              if !self.link_output.module_table[importee_module_idx]
+                .side_effects()
+                .has_side_effects()
+              {
+                continue;
+              }
+              let Some(importee_chunk_idx) = chunk_graph.module_to_chunk[importee_module_idx]
+              else {
+                continue;
+              };
+              if importee_chunk_idx == chunk_id {
+                continue;
+              }
+              index_cross_chunk_imports[chunk_id].insert(importee_chunk_idx);
+              let imports_from_other_chunks = &mut index_imports_from_other_chunks[chunk_id];
+              imports_from_other_chunks.entry(importee_chunk_idx).or_default();
+            }
+
+            // Runtime module may have side effects (e.g. dev/HMR mode) without an import record.
+            if self.link_output.metas[module_idx].has_side_effectful_runtime_dep {
+              let runtime_idx = self.link_output.runtime.id();
+              if let Some(runtime_chunk_idx) = chunk_graph.module_to_chunk[runtime_idx] {
+                if runtime_chunk_idx != chunk_id {
+                  index_cross_chunk_imports[chunk_id].insert(runtime_chunk_idx);
+                  let imports_from_other_chunks = &mut index_imports_from_other_chunks[chunk_id];
+                  imports_from_other_chunks.entry(runtime_chunk_idx).or_default();
+                }
+              }
+            }
           }
         }
       });

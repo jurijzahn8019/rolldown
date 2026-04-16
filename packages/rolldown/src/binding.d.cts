@@ -2,7 +2,7 @@ type MaybePromise<T> = T | Promise<T>
 type Nullable<T> = T | null | undefined
 type VoidNullable<T = void> = T | null | undefined | void
 export type BindingStringOrRegex = string | RegExp
-type BindingResult<T> = { errors: BindingError[], isBindingErrors: boolean } | T
+export type BindingResult<T> = { errors: BindingError[], isBindingErrors: boolean } | T
 
 export interface CodegenOptions {
   /**
@@ -101,7 +101,7 @@ export interface MangleOptions {
   /**
    * Pass `true` to mangle names declared in the top level scope.
    *
-   * @default false
+   * @default true for modules and commonjs, otherwise false
    */
   toplevel?: boolean
   /**
@@ -177,6 +177,15 @@ export interface TreeShakeOptions {
    * @default 'always'
    */
   propertyReadSideEffects?: boolean | 'always'
+  /**
+   * Whether property write accesses (assignments to member expressions) have side effects.
+   *
+   * When false, assignments like `obj.prop = value` are considered side-effect-free
+   * (assuming the object and value expressions themselves are side-effect-free).
+   *
+   * @default true
+   */
+  propertyWriteSideEffects?: boolean
   /**
    * Whether accessing a global variable has side effects.
    *
@@ -314,9 +323,17 @@ export type ImportNameKind = /** `import { x } from "mod"` */
 'Default';
 
 /**
- * Parse asynchronously.
+ * Parse JS/TS source asynchronously on a separate thread.
  *
- * Note: This function can be slower than `parseSync` due to the overhead of spawning a thread.
+ * Note that not all of the workload can happen on a separate thread.
+ * Parsing on Rust side does happen in a separate thread, but deserialization of the AST to JS objects
+ * has to happen on current thread. This synchronous deserialization work typically outweighs
+ * the asynchronous parsing by a factor of between 3 and 20.
+ *
+ * i.e. the majority of the workload cannot be parallelized by using this method.
+ *
+ * Generally `parseSync` is preferable to use as it does not have the overhead of spawning a thread.
+ * If you need to parallelize parsing multiple files, it is recommended to use worker threads.
  */
 export declare function parse(filename: string, sourceText: string, options?: ParserOptions | undefined | null): Promise<ParseResult>
 
@@ -361,7 +378,16 @@ export interface ParserOptions {
   showSemanticErrors?: boolean
 }
 
-/** Parse synchronously. */
+/**
+ * Parse JS/TS source synchronously on current thread.
+ *
+ * This is generally preferable over `parse` (async) as it does not have the overhead
+ * of spawning a thread, and the majority of the workload cannot be parallelized anyway
+ * (see `parse` documentation for details).
+ *
+ * If you need to parallelize parsing multiple files, it is recommended to use worker threads
+ * with `parseSync` rather than using `parse`.
+ */
 export declare function parseSync(filename: string, sourceText: string, options?: ParserOptions | undefined | null): ParseResult
 
 /** Returns `true` if raw transfer is supported on this platform. */
@@ -492,6 +518,20 @@ export declare class ResolverFactory {
    * This method automatically discovers tsconfig.json by traversing parent directories.
    */
   resolveFileAsync(file: string, request: string): Promise<ResolveResult>
+  /**
+   * Synchronously resolve `specifier` for TypeScript declaration files.
+   *
+   * `file` is the absolute path to the containing file.
+   * Uses TypeScript's `moduleResolution: "bundler"` algorithm.
+   */
+  resolveDtsSync(file: string, request: string): ResolveResult
+  /**
+   * Asynchronously resolve `specifier` for TypeScript declaration files.
+   *
+   * `file` is the absolute path to the containing file.
+   * Uses TypeScript's `moduleResolution: "bundler"` algorithm.
+   */
+  resolveDtsAsync(file: string, request: string): Promise<ResolveResult>
 }
 
 /** Node.js builtin module when `Options::builtin_modules` is enabled. */
@@ -674,6 +714,15 @@ export interface NapiResolveOptions {
    * Default `true`
    */
   symlinks?: boolean
+  /**
+   * Whether to read the `NODE_PATH` environment variable and append its entries to `modules`.
+   *
+   * `NODE_PATH` is a deprecated Node.js feature that is not part of ESM resolution.
+   * Set this to `false` to disable the behavior.
+   *
+   * Default `true`
+   */
+  nodePath?: boolean
   /**
    * Whether to parse [module.builtinModules](https://nodejs.org/api/module.html#modulebuiltinmodules) or not.
    * For example, "zlib" will throw [crate::ResolveError::Builtin] when set to true.
@@ -906,7 +955,7 @@ export declare function isolatedDeclarationSync(filename: string, sourceText: st
 /**
  * Configure how TSX and JSX are transformed.
  *
- * @see {@link https://babeljs.io/docs/babel-plugin-transform-react-jsx#options}
+ * @see {@link https://oxc.rs/docs/guide/usage/transformer/jsx}
  */
 export interface JsxOptions {
   /**
@@ -922,8 +971,6 @@ export interface JsxOptions {
    * Emit development-specific information, such as `__source` and `__self`.
    *
    * @default false
-   *
-   * @see {@link https://babeljs.io/docs/babel-plugin-transform-react-jsx-development}
    */
   development?: boolean
   /**
@@ -937,11 +984,7 @@ export interface JsxOptions {
    */
   throwIfNamespace?: boolean
   /**
-   * Enables `@babel/plugin-transform-react-pure-annotations`.
-   *
-   * It will mark JSX elements and top-level React method calls as pure for tree shaking.
-   *
-   * @see {@link https://babeljs.io/docs/en/babel-plugin-transform-react-pure-annotations}
+   * Mark JSX elements and top-level React method calls as pure for tree shaking.
    *
    * @default true
    */
@@ -971,23 +1014,6 @@ export interface JsxOptions {
    * @default 'React.Fragment'
    */
   pragmaFrag?: string
-  /**
-   * When spreading props, use `Object.assign` directly instead of an extend helper.
-   *
-   * Only used for `classic` {@link runtime}.
-   *
-   * @default false
-   */
-  useBuiltIns?: boolean
-  /**
-   * When spreading props, use inline object with spread elements directly
-   * instead of an extend helper or Object.assign.
-   *
-   * Only used for `classic` {@link runtime}.
-   *
-   * @default false
-   */
-  useSpread?: boolean
   /**
    * Enable React Fast Refresh .
    *
@@ -1080,7 +1106,7 @@ export interface ReactRefreshOptions {
 /**
  * Configure how styled-components are transformed.
  *
- * @see {@link https://styled-components.com/docs/tooling#babel-plugin}
+ * @see {@link https://oxc.rs/docs/guide/usage/transformer/plugins#styled-components}
  */
 export interface StyledComponentsOptions {
   /**
@@ -1199,9 +1225,15 @@ export interface TransformOptions {
   sourcemap?: boolean
   /** Set assumptions in order to produce smaller output. */
   assumptions?: CompilerAssumptions
-  /** Configure how TypeScript is transformed. */
+  /**
+   * Configure how TypeScript is transformed.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/typescript}
+   */
   typescript?: TypeScriptOptions
-  /** Configure how TSX and JSX are transformed. */
+  /**
+   * Configure how TSX and JSX are transformed.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/jsx}
+   */
   jsx?: 'preserve' | JsxOptions
   /**
    * Sets the target environment for the generated JavaScript.
@@ -1215,18 +1247,27 @@ export interface TransformOptions {
    *
    * @default `esnext` (No transformation)
    *
-   * @see [esbuild#target](https://esbuild.github.io/api/#target)
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/lowering#target}
    */
   target?: string | Array<string>
   /** Behaviour for runtime helpers. */
   helpers?: Helpers
-  /** Define Plugin */
+  /**
+   * Define Plugin
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/global-variable-replacement#define}
+   */
   define?: Record<string, string>
-  /** Inject Plugin */
+  /**
+   * Inject Plugin
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/global-variable-replacement#inject}
+   */
   inject?: Record<string, string | [string, string]>
   /** Decorator plugin */
   decorator?: DecoratorOptions
-  /** Third-party plugins to use. */
+  /**
+   * Third-party plugins to use.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/plugins}
+   */
   plugins?: PluginsOptions
 }
 
@@ -1346,6 +1387,24 @@ export interface TypeScriptOptions {
    */
   removeClassFieldsWithoutInitializer?: boolean
   /**
+   * When true, optimize const enums by inlining their values at usage sites
+   * and removing the enum declaration.
+   *
+   * @default false
+   */
+  optimizeConstEnums?: boolean
+  /**
+   * When true, optimize regular (non-const) enums by inlining their member
+   * accesses at usage sites when the member value is statically known.
+   *
+   * Non-exported enum declarations are also removed when all members are
+   * evaluable and no references to the enum as a runtime value exist
+   * (e.g., `console.log(Foo)`, `typeof Foo`, or passing the enum as an argument).
+   *
+   * @default false
+   */
+  optimizeEnums?: boolean
+  /**
    * Also generate a `.d.ts` declaration file for TypeScript files.
    *
    * The source file must be compliant with all
@@ -1390,6 +1449,7 @@ export declare class BindingBundler {
 
 export declare class BindingCallableBuiltinPlugin {
   constructor(plugin: BindingBuiltinPlugin)
+  getOrder(hookName: string): string | null
   resolveId(id: string, importer?: string | undefined | null, options?: BindingHookJsResolveIdOptions | undefined | null): Promise<BindingHookJsResolveIdOutput | undefined | null>
   load(id: string): Promise<BindingHookJsLoadOutput | undefined | null>
   transform(code: string, id: string, options: BindingTransformHookExtraArgs): Promise<BindingHookTransformOutput | undefined | null>
@@ -1417,6 +1477,8 @@ export declare class BindingDecodedMap {
    * Each line is an array of segments, where each segment is [generatedColumn, sourceIndex, originalLine, originalColumn, nameIndex?].
    */
   get mappings(): Array<Array<Array<number>>>
+  /** The list of source indices that should be excluded from debugging. */
+  get x_google_ignoreList(): Array<number> | null
 }
 
 export declare class BindingDevEngine {
@@ -1439,24 +1501,40 @@ export declare class BindingDevEngine {
   compileEntry(moduleId: string, clientId: string): Promise<string>
 }
 
+export declare class BindingLoadPluginContext {
+  inner(): BindingPluginContext
+  addWatchFile(file: string): void
+}
+
 export declare class BindingMagicString {
   constructor(source: string, options?: BindingMagicStringOptions | undefined | null)
+  get original(): string
   get filename(): string | null
+  get indentExclusionRanges(): Array<Array<number>> | Array<number> | null
+  get ignoreList(): boolean
+  get offset(): number
+  set offset(offset: number)
   replace(from: string, to: string): this
   replaceAll(from: string, to: string): this
+  /**
+   * Returns the UTF-16 offset past the last match, or -1 if no match was found.
+   * The JS wrapper uses this to update `lastIndex` on the caller's RegExp.
+   * Global/sticky behavior is derived from the regex's own flags.
+   */
+  replaceRegex(from: RegExp, to: string): number
   prepend(content: string): this
   append(content: string): this
   prependLeft(index: number, content: string): this
   prependRight(index: number, content: string): this
   appendLeft(index: number, content: string): this
   appendRight(index: number, content: string): this
-  overwrite(start: number, end: number, content: string): this
+  overwrite(start: number, end: number, content: string, options?: BindingOverwriteOptions | undefined | null): this
   toString(): string
   hasChanged(): boolean
   length(): number
   isEmpty(): boolean
   remove(start: number, end: number): this
-  update(start: number, end: number, content: string): this
+  update(start: number, end: number, content: string, options?: BindingUpdateOptions | undefined | null): this
   relocate(start: number, end: number, to: number): this
   /**
    * Alias for `relocate` to match the original magic-string API.
@@ -1464,7 +1542,7 @@ export declare class BindingMagicString {
    * Returns `this` for method chaining.
    */
   move(start: number, end: number, index: number): this
-  indent(indentor?: string | undefined | null): this
+  indent(indentor?: string | undefined | null, options?: BindingIndentOptions | undefined | null): this
   /** Trims whitespace or specified characters from the start and end. */
   trim(charType?: string | undefined | null): this
   /** Trims whitespace or specified characters from the start. */
@@ -1484,6 +1562,8 @@ export declare class BindingMagicString {
   lastChar(): string
   /** Returns the content after the last newline in the generated string. */
   lastLine(): string
+  /** Returns the guessed indentation string, or `\t` if none is found. */
+  getIndentString(): string
   /** Returns a clone with content outside the specified range removed. */
   snip(start: number, end: number): BindingMagicString
   /**
@@ -1493,8 +1573,12 @@ export declare class BindingMagicString {
    */
   reset(start: number, end: number): this
   /**
-   * Returns the content between the specified original character positions.
+   * Returns the content between the specified UTF-16 code unit positions (JS string indices).
    * Supports negative indices (counting from the end).
+   *
+   * When an index falls in the middle of a surrogate pair, the lone surrogate is
+   * included in the result (matching the original magic-string / JS behavior).
+   * This is done by returning a UTF-16 encoded JS string via `napi_create_string_utf16`.
    */
   slice(start?: number | undefined | null, end?: number | undefined | null): string
   /**
@@ -1517,6 +1601,7 @@ export declare class BindingModuleInfo {
   dynamicallyImportedIds: Array<string>
   exports: Array<string>
   isEntry: boolean
+  inputFormat: 'es' | 'cjs' | 'unknown'
   get code(): string | null
 }
 
@@ -1526,8 +1611,6 @@ export declare class BindingNormalizedOptions {
   get platform(): 'node' | 'browser' | 'neutral'
   get shimMissingExports(): boolean
   get name(): string | null
-  get cssEntryFilenames(): string | undefined
-  get cssChunkFilenames(): string | undefined
   get entryFilenames(): string | undefined
   get chunkFilenames(): string | undefined
   get assetFilenames(): string | undefined
@@ -1551,9 +1634,11 @@ export declare class BindingNormalizedOptions {
   get globals(): Record<string, string> | undefined
   get hashCharacters(): 'base64' | 'base36' | 'hex'
   get sourcemapDebugIds(): boolean
+  get sourcemapExcludeSources(): boolean
   get polyfillRequire(): boolean
   get minify(): false | 'dce-only' | MinifyOptions
   get legalComments(): 'none' | 'inline'
+  get comments(): BindingCommentsOptions
   get preserveModules(): boolean
   get preserveModulesRoot(): string | undefined
   get virtualDirname(): string
@@ -1638,6 +1723,8 @@ export declare class BindingSourceMap {
   get names(): Array<string>
   /** The VLQ-encoded mappings string. */
   get mappings(): string
+  /** The list of source indices that should be excluded from debugging. */
+  get x_google_ignoreList(): Array<number> | null
   /** Returns the source map as a JSON string. */
   toString(): string
   /** Returns the source map as a base64-encoded data URL. */
@@ -1652,14 +1739,19 @@ export declare class BindingTransformPluginContext {
 }
 
 export declare class BindingWatcher {
-  constructor(options: Array<BindingBundlerOptions>, notifyOption?: BindingNotifyOption | undefined | null)
+  constructor(options: BindingBundlerOptions[], listener: (data: BindingWatcherEvent) => void)
+  run(): Promise<void>
+  /**
+   * Gives consumers a reliable way to await the watcher's completion.
+   * The Node.js layer relies on the pending Promise to keep the process from exiting.
+   */
+  waitForClose(): Promise<void>
   close(): Promise<void>
-  start(listener: (data: BindingWatcherEvent) => void): Promise<void>
 }
 
 /**
- * Minimal wrapper around the core `Bundler` for watcher events.
- * This is returned from watcher event data to allow access to the bundler instance.
+ * Minimal wrapper around a `BundleHandle` for watcher events.
+ * This is returned from watcher event data to allow calling `result.close()`.
  */
 export declare class BindingWatcherBundler {
   close(): Promise<void>
@@ -1672,10 +1764,10 @@ export declare class BindingWatcherChangeData {
 
 export declare class BindingWatcherEvent {
   eventKind(): string
-  watchChangeData(): BindingWatcherChangeData
-  bundleEndData(): BindingBundleEndEventData
   bundleEventKind(): string
+  bundleEndData(): BindingBundleEndEventData
   bundleErrorData(): BindingBundleErrorEventData
+  watchChangeData(): BindingWatcherChangeData
 }
 
 export declare class ParallelJsPluginRegistry {
@@ -1691,6 +1783,19 @@ export declare class ScheduledBuild {
 
 export declare class TraceSubscriberGuard {
   close(): void
+}
+
+export declare class TsconfigCache {
+  /** Create a new transform cache with auto tsconfig discovery enabled. */
+  constructor(yarnPnp: boolean)
+  /**
+   * Clear the cache.
+   *
+   * Call this when tsconfig files have changed to ensure fresh resolution.
+   */
+  clear(): void
+  /** Get the number of cached entries. */
+  size(): number
 }
 
 export interface AliasItem {
@@ -1713,7 +1818,8 @@ export interface BindingBuiltinPlugin {
   options?: unknown
 }
 
-export type BindingBuiltinPluginName =  'builtin:esm-external-require'|
+export type BindingBuiltinPluginName =  'builtin:bundle-analyzer'|
+'builtin:esm-external-require'|
 'builtin:isolated-declaration'|
 'builtin:replace'|
 'builtin:vite-alias'|
@@ -1729,8 +1835,15 @@ export type BindingBuiltinPluginName =  'builtin:esm-external-require'|
 'builtin:vite-resolve'|
 'builtin:vite-transform'|
 'builtin:vite-wasm-fallback'|
-'builtin:vite-wasm-helper'|
-'builtin:vite-web-worker-post';
+'builtin:vite-web-worker-post'|
+'builtin:oxc-runtime';
+
+export interface BindingBundleAnalyzerPluginConfig {
+  /** Output filename for the bundle analysis data (default: "analyze-data.json") */
+  fileName?: string
+  /** Output format: "json" (default) or "md" for LLM-friendly markdown */
+  format?: 'json' | 'md'
+}
 
 export interface BindingBundlerOptions {
   inputOptions: BindingInputOptions
@@ -1761,6 +1874,9 @@ export interface BindingChecksOptions {
   preferBuiltinFeature?: boolean
   couldNotCleanDirectory?: boolean
   pluginTimings?: boolean
+  duplicateShebang?: boolean
+  unsupportedTsconfigOption?: boolean
+  ineffectiveDynamicImport?: boolean
 }
 
 export interface BindingChunkImportMap {
@@ -1776,6 +1892,32 @@ export declare enum BindingChunkModuleOrderBy {
 export interface BindingClientHmrUpdate {
   clientId: string
   update: BindingHmrUpdate
+}
+
+export interface BindingCommentsOptions {
+  legal?: boolean
+  annotation?: boolean
+  jsdoc?: boolean
+}
+
+export interface BindingCompilerOptions {
+  baseUrl?: string
+  paths?: Record<string, Array<string>>
+  experimentalDecorators?: boolean
+  emitDecoratorMetadata?: boolean
+  useDefineForClassFields?: boolean
+  rewriteRelativeImportExtensions?: boolean
+  jsx?: string
+  jsxFactory?: string
+  jsxFragmentFactory?: string
+  jsxImportSource?: string
+  verbatimModuleSyntax?: boolean
+  preserveValueImports?: boolean
+  importsNotUsedAsValues?: string
+  target?: string
+  module?: string
+  allowJs?: boolean
+  rootDirs?: Array<string>
 }
 
 export interface BindingDeferSyncScanData {
@@ -1822,10 +1964,140 @@ export interface BindingEmittedChunk {
 
 export interface BindingEmittedPrebuiltChunk {
   fileName: string
+  name?: string
   code: string
   exports?: Array<string>
   map?: BindingSourcemap
   sourcemapFileName?: string
+  facadeModuleId?: string
+  isEntry?: boolean
+  isDynamicEntry?: boolean
+}
+
+/** Enhanced transform options with tsconfig and inputMap support. */
+export interface BindingEnhancedTransformOptions {
+  /** Treat the source text as 'js', 'jsx', 'ts', 'tsx', or 'dts'. */
+  lang?: 'js' | 'jsx' | 'ts' | 'tsx' | 'dts'
+  /** Treat the source text as 'script', 'module', 'commonjs', or 'unambiguous'. */
+  sourceType?: 'script' | 'module' | 'commonjs' | 'unambiguous' | undefined
+  /**
+   * The current working directory. Used to resolve relative paths in other
+   * options.
+   */
+  cwd?: string
+  /**
+   * Enable source map generation.
+   *
+   * When `true`, the `sourceMap` field of transform result objects will be populated.
+   *
+   * @default false
+   */
+  sourcemap?: boolean
+  /** Set assumptions in order to produce smaller output. */
+  assumptions?: CompilerAssumptions
+  /**
+   * Configure how TypeScript is transformed.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/typescript}
+   */
+  typescript?: TypeScriptOptions
+  /**
+   * Configure how TSX and JSX are transformed.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/jsx}
+   */
+  jsx?: 'preserve' | JsxOptions
+  /**
+   * Sets the target environment for the generated JavaScript.
+   *
+   * The lowest target is `es2015`.
+   *
+   * Example:
+   *
+   * * `'es2015'`
+   * * `['es2020', 'chrome58', 'edge16', 'firefox57', 'node12', 'safari11']`
+   *
+   * @default `esnext` (No transformation)
+   *
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/lowering#target}
+   */
+  target?: string | Array<string>
+  /** Behaviour for runtime helpers. */
+  helpers?: Helpers
+  /**
+   * Define Plugin
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/global-variable-replacement#define}
+   */
+  define?: Record<string, string>
+  /**
+   * Inject Plugin
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/global-variable-replacement#inject}
+   */
+  inject?: Record<string, string | [string, string]>
+  /** Decorator plugin */
+  decorator?: DecoratorOptions
+  /**
+   * Third-party plugins to use.
+   * @see {@link https://oxc.rs/docs/guide/usage/transformer/plugins}
+   */
+  plugins?: PluginsOptions
+  /**
+   * Configure tsconfig handling.
+   * - true: Auto-discover and load the nearest tsconfig.json
+   * - TsconfigRawOptions: Use the provided inline tsconfig options
+   */
+  tsconfig?: boolean | BindingTsconfigRawOptions
+  /** An input source map to collapse with the output source map. */
+  inputMap?: SourceMap
+}
+
+/** Result of the enhanced transform API. */
+export interface BindingEnhancedTransformResult {
+  /**
+   * The transformed code.
+   *
+   * If parsing failed, this will be an empty string.
+   */
+  code: string
+  /**
+   * The source map for the transformed code.
+   *
+   * This will be set if {@link BindingEnhancedTransformOptions#sourcemap} is `true`.
+   */
+  map?: SourceMap
+  /**
+   * The `.d.ts` declaration file for the transformed code. Declarations are
+   * only generated if `declaration` is set to `true` and a TypeScript file
+   * is provided.
+   *
+   * If parsing failed and `declaration` is set, this will be an empty string.
+   *
+   * @see {@link TypeScriptOptions#declaration}
+   * @see [declaration tsconfig option](https://www.typescriptlang.org/tsconfig/#declaration)
+   */
+  declaration?: string
+  /**
+   * Declaration source map. Only generated if both
+   * {@link TypeScriptOptions#declaration declaration} and
+   * {@link BindingEnhancedTransformOptions#sourcemap sourcemap} are set to `true`.
+   */
+  declarationMap?: SourceMap
+  /**
+   * Helpers used.
+   *
+   * @internal
+   *
+   * Example:
+   *
+   * ```text
+   * { "_objectSpread": "@oxc-project/runtime/helpers/objectSpread2" }
+   * ```
+   */
+  helpersUsed: Record<string, string>
+  /** Parse and transformation errors. */
+  errors: Array<BindingError>
+  /** Parse and transformation warnings. */
+  warnings: Array<BindingError>
+  /** Paths to tsconfig files that were loaded during transformation. */
+  tsconfigFilePaths: Array<string>
 }
 
 export type BindingError =
@@ -1858,7 +2130,6 @@ export interface BindingExperimentalOptions {
   chunkImportMap?: boolean | BindingChunkImportMap
   onDemandWrapping?: boolean
   incrementalBuild?: boolean
-  transformHiresSourcemap?: boolean | 'boundary'
   nativeMagicString?: boolean
   chunkOptimization?: boolean
   lazyBarrel?: boolean
@@ -1957,6 +2228,10 @@ export interface BindingHookTransformOutput {
   moduleSideEffects?: BindingHookSideEffects
   map?: BindingSourcemap
   moduleType?: string
+}
+
+export interface BindingIndentOptions {
+  exclude?: Array<Array<number>> | Array<number>
 }
 
 export interface BindingInjectImportNamed {
@@ -2063,6 +2338,9 @@ export interface BindingLogLocation {
 
 export interface BindingMagicStringOptions {
   filename?: string
+  offset?: number
+  indentExclusionRanges?: Array<Array<number>> | Array<number>
+  ignoreList?: boolean
 }
 
 export type BindingMakeAbsoluteExternalsRelative =
@@ -2088,6 +2366,9 @@ export interface BindingMatchGroup {
   minModuleSize?: number
   maxModuleSize?: number
   maxSize?: number
+  entriesAware?: boolean
+  entriesAwareMergeThreshold?: number
+  tags?: Array<string>
 }
 
 export interface BindingModulePreloadOptions {
@@ -2106,11 +2387,6 @@ export interface BindingModuleSideEffectsRule {
   external?: boolean | undefined
 }
 
-export interface BindingNotifyOption {
-  pollInterval?: number
-  compareContents?: boolean
-}
-
 export interface BindingOptimization {
   inlineConst?: boolean | BindingInlineConstConfig
   pifeForModuleWrappers?: boolean
@@ -2121,8 +2397,6 @@ export interface BindingOutputOptions {
   assetFileNames?: string | ((chunk: BindingPreRenderedAsset) => string)
   entryFileNames?: string | ((chunk: PreRenderedChunk) => string)
   chunkFileNames?: string | ((chunk: PreRenderedChunk) => string)
-  cssEntryFileNames?: string | ((chunk: PreRenderedChunk) => string)
-  cssChunkFileNames?: string | ((chunk: PreRenderedChunk) => string)
   sanitizeFileName?: boolean | ((name: string) => string)
   banner?: string | ((chunk: BindingRenderedChunk) => MaybePromise<VoidNullable<string>>)
   postBanner?: string | ((chunk: BindingRenderedChunk) => MaybePromise<VoidNullable<string>>)
@@ -2149,9 +2423,12 @@ export interface BindingOutputOptions {
   sourcemapIgnoreList?: boolean | string | RegExp | ((source: string, sourcemapPath: string) => boolean)
   sourcemapDebugIds?: boolean
   sourcemapPathTransform?: (source: string, sourcemapPath: string) => string
+  sourcemapExcludeSources?: boolean
+  strict?: boolean | 'auto'
   minify?: boolean | 'dce-only' | MinifyOptions
   manualCodeSplitting?: BindingManualCodeSplittingOptions
   legalComments?: 'none' | 'inline'
+  comments?: boolean | BindingCommentsOptions
   polyfillRequire?: boolean
   preserveModules?: boolean
   virtualDirname?: string
@@ -2165,6 +2442,10 @@ export interface BindingOutputOptions {
 export interface BindingOutputs {
   chunks: Array<BindingOutputChunk>
   assets: Array<BindingOutputAsset>
+}
+
+export interface BindingOverwriteOptions {
+  contentOnly?: boolean
 }
 
 export interface BindingPluginContextResolvedId {
@@ -2205,7 +2486,7 @@ export interface BindingPluginOptions {
   resolveIdFilter?: BindingHookFilter
   resolveDynamicImport?: (ctx: BindingPluginContext, specifier: string, importer: Nullable<string>) => MaybePromise<VoidNullable<BindingHookResolveIdOutput>>
   resolveDynamicImportMeta?: BindingPluginHookMeta
-  load?: (ctx: BindingPluginContext, id: string) => MaybePromise<VoidNullable<BindingHookLoadOutput>>
+  load?: (ctx: BindingLoadPluginContext, id: string) => MaybePromise<VoidNullable<BindingHookLoadOutput>>
   loadMeta?: BindingPluginHookMeta
   loadFilter?: BindingHookFilter
   transform?: (ctx:  BindingTransformPluginContext, id: string, code: string, module_type: BindingTransformHookExtraArgs) => MaybePromise<VoidNullable<BindingHookTransformOutput>>
@@ -2358,6 +2639,62 @@ export interface BindingTreeshake {
   propertyWriteSideEffects?: BindingPropertyWriteSideEffects
 }
 
+export interface BindingTsconfig {
+  files?: Array<string>
+  include?: Array<string>
+  exclude?: Array<string>
+  compilerOptions: BindingCompilerOptions
+}
+
+/**
+ * TypeScript compiler options for inline tsconfig configuration.
+ *
+ * @category Utilities
+ */
+export interface BindingTsconfigCompilerOptions {
+  /** Specifies the JSX factory function to use. */
+  jsx?: 'react' | 'react-jsx' | 'react-jsxdev' | 'preserve' | 'react-native'
+  /** Specifies the JSX factory function. */
+  jsxFactory?: string
+  /** Specifies the JSX fragment factory function. */
+  jsxFragmentFactory?: string
+  /** Specifies the module specifier for JSX imports. */
+  jsxImportSource?: string
+  /** Enables experimental decorators. */
+  experimentalDecorators?: boolean
+  /** Enables decorator metadata emission. */
+  emitDecoratorMetadata?: boolean
+  /** Preserves module structure of imports/exports. */
+  verbatimModuleSyntax?: boolean
+  /** Configures how class fields are emitted. */
+  useDefineForClassFields?: boolean
+  /** The ECMAScript target version. */
+  target?: string
+  /** @deprecated Use verbatimModuleSyntax instead. */
+  preserveValueImports?: boolean
+  /** @deprecated Use verbatimModuleSyntax instead. */
+  importsNotUsedAsValues?: 'remove' | 'preserve' | 'error'
+}
+
+/**
+ * Raw tsconfig options for inline configuration.
+ *
+ * @category Utilities
+ */
+export interface BindingTsconfigRawOptions {
+  /** TypeScript compiler options. */
+  compilerOptions?: BindingTsconfigCompilerOptions
+}
+
+export interface BindingTsconfigResult {
+  tsconfig: BindingTsconfig
+  tsconfigFilePaths: Array<string>
+}
+
+export interface BindingUpdateOptions {
+  overwrite?: boolean
+}
+
 export interface BindingViteAliasPluginAlias {
   find: BindingStringOrRegex
   replacement: string
@@ -2385,24 +2722,16 @@ export interface BindingViteBuildImportAnalysisPluginV2Config {
 }
 
 export interface BindingViteDynamicImportVarsPluginConfig {
+  sourcemap?: boolean
   include?: Array<BindingStringOrRegex>
   exclude?: Array<BindingStringOrRegex>
   resolver?: (id: string, importer: string) => MaybePromise<string | undefined>
-  isV2?: BindingViteDynamicImportVarsPluginV2Config
-}
-
-export interface BindingViteDynamicImportVarsPluginV2Config {
-  sourcemap: boolean
 }
 
 export interface BindingViteImportGlobPluginConfig {
   root?: string
-  restoreQueryExtension?: boolean
-  isV2?: BindingViteImportGlobPluginV2Config
-}
-
-export interface BindingViteImportGlobPluginV2Config {
   sourcemap?: boolean
+  restoreQueryExtension?: boolean
 }
 
 export interface BindingViteJsonPluginConfig {
@@ -2444,9 +2773,9 @@ export interface BindingViteReporterPluginConfig {
   isLib: boolean
   assetsDir: string
   chunkLimit: number
-  shouldLogInfo: boolean
   warnLargeChunks: boolean
   reportCompressedSize: boolean
+  logInfo?: (msg: string) => void
 }
 
 export interface BindingViteResolvePluginConfig {
@@ -2497,27 +2826,25 @@ export interface BindingViteTransformPluginConfig {
   yarnPnp?: boolean
 }
 
-export interface BindingViteWasmHelperPluginConfig {
-  decodedBase: string
-  v2?: BindingViteWasmHelperPluginV2Config
-}
-
-export interface BindingViteWasmHelperPluginV2Config {
-  root: string
-  isLib: boolean
-  publicDir: string
-  assetInlineLimit: number | ((file: string, content: Buffer) => boolean | undefined)
-}
-
 export interface BindingWatchOption {
   skipWrite?: boolean
   include?: Array<BindingStringOrRegex>
   exclude?: Array<BindingStringOrRegex>
   buildDelay?: number
+  usePolling?: boolean
+  pollInterval?: number
+  compareContentsForPolling?: boolean
+  useDebounce?: boolean
+  debounceDelay?: number
+  debounceTickRate?: number
   onInvalidate?: ((id: string) => void) | undefined
 }
 
-export declare function createTokioRuntime(blockingThreads?: number | undefined | null): void
+export declare function collapseSourcemaps(sourcemapChain: Array<BindingSourcemap>): BindingJsonSourcemap
+
+export declare function enhancedTransform(filename: string, sourceText: string, options: BindingEnhancedTransformOptions | undefined | null, cache: TsconfigCache | undefined | null, yarnPnp: boolean): Promise<BindingEnhancedTransformResult>
+
+export declare function enhancedTransformSync(filename: string, sourceText: string, options: BindingEnhancedTransformOptions | undefined | null, cache: TsconfigCache | undefined | null, yarnPnp: boolean): BindingEnhancedTransformResult
 
 export interface ExtensionAliasItem {
   target: string
@@ -2603,6 +2930,8 @@ export interface PreRenderedChunk {
 }
 
 export declare function registerPlugins(id: number, plugins: Array<BindingPluginWithIndex>): void
+
+export declare function resolveTsconfig(filename: string, cache: TsconfigCache | undefined | null, yarnPnp: boolean): BindingTsconfigResult | null
 
 /**
  * Shutdown the tokio runtime manually.

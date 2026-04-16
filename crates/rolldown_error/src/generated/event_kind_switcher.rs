@@ -20,9 +20,9 @@ bitflags! {
     const UnresolvedEntry = 1 << 13;
     const UnresolvedImport = 1 << 14;
     const FilenameConflict = 1 << 15;
-    const AssignToImportError = 1 << 16;
-    const CommonJsVariableInEsm = 1 << 17;
-    const ExportUndefinedVariableError = 1 << 18;
+    const FilenameOutsideOutputDirectoryError = 1 << 16;
+    const AssignToImportError = 1 << 17;
+    const CommonJsVariableInEsm = 1 << 18;
     const ImportIsUndefined = 1 << 19;
     const UnsupportedFeatureError = 1 << 20;
     const EmptyImportMeta = 1 << 21;
@@ -43,5 +43,11 @@ bitflags! {
     const AlreadyClosedError = 1 << 36;
     const CouldNotCleanDirectory = 1 << 37;
     const PluginTimings = 1 << 38;
+    const DuplicateShebang = 1 << 39;
+    const TsConfigError = 1 << 40;
+    const UnsupportedTsconfigOption = 1 << 41;
+    const RuntimeModuleSymbolNotFoundError = 1 << 42;
+    const IneffectiveDynamicImport = 1 << 44;
+    const RequireTlaError = 1 << 45;
   }
 }

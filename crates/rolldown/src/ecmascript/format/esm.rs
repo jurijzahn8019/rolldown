@@ -2,7 +2,7 @@ use arcstr::ArcStr;
 use itertools::Itertools;
 use rolldown_common::{
   AddonRenderContext, ExportsKind, ExternalModule, ImportRecordIdx, ModuleIdx, ModuleTable,
-  Specifier,
+  Specifier, SymbolRef,
 };
 use rolldown_sourcemap::SourceJoiner;
 use rolldown_utils::{concat_string, ecmascript::to_module_import_export_name};
@@ -15,7 +15,7 @@ use crate::{
 };
 use json_escape_simd::escape;
 
-use super::utils::render_chunk_directives;
+use super::utils::{is_use_strict_directive, render_chunk_directives};
 
 #[expect(clippy::needless_pass_by_value)]
 pub fn render_esm<'code>(
@@ -37,11 +37,8 @@ pub fn render_esm<'code>(
 
   // https://github.com/evanw/esbuild/blob/d34e79e2a998c21bb71d57b92b0017ca11756912/internal/linker/linker.go#L5686-L5698
   if !directives.is_empty() {
-    let rendered_chunk_directives = render_chunk_directives(directives.iter().filter(|d| {
-      let normalized_directive =
-        d.trim_start_matches(['\'', '"']).trim_end_matches(['\'', '"', ';']);
-      normalized_directive != "use strict"
-    }));
+    let rendered_chunk_directives =
+      render_chunk_directives(directives.iter().filter(|d| !is_use_strict_directive(d)));
     if !rendered_chunk_directives.is_empty() {
       source_joiner.append_source(rendered_chunk_directives);
     }
@@ -60,7 +57,7 @@ pub fn render_esm<'code>(
       for importee_idx in ctx.chunk.entry_level_external_module_idx.iter().copied() {
         let importee = &ctx.link_output.module_table[importee_idx];
         if let Some(m) = importee.as_external() {
-          let ext_name = m.get_import_path(ctx.chunk, ctx.options.paths.as_ref());
+          let ext_name = m.get_import_path(ctx.chunk, ctx.resolved_paths);
           source_joiner.append_source(concat_string!("export * from \"", ext_name, "\"\n"));
         }
       }
@@ -210,10 +207,18 @@ fn render_esm_chunk_imports(ctx: &GenerateContext<'_>) -> Option<String> {
   ctx.chunk.imports_from_other_chunks.iter().for_each(|(exporter_id, items)| {
     let importee_chunk = &ctx.chunk_graph.chunk_table[*exporter_id];
     let mut default_alias = vec![];
+    // Track seen canonical refs to avoid duplicate imports.
+    // Multiple import_refs can resolve to the same canonical_ref (e.g., re-exports from CJS modules),
+    // and we only need to import once per unique canonical symbol.
+    let mut seen_canonical_refs: FxHashSet<SymbolRef> = FxHashSet::default();
     let mut specifiers = items
       .iter()
       .filter_map(|item| {
         let canonical_ref = ctx.link_output.symbol_db.canonical_ref_for(item.import_ref);
+        // Skip if we've already processed this canonical symbol
+        if !seen_canonical_refs.insert(canonical_ref) {
+          return None;
+        }
         let imported = ctx
           .link_output
           .symbol_db
@@ -354,7 +359,7 @@ where
           s.push_str("import * as ");
           s.push_str(alias);
           s.push_str(" from ");
-          s.push_str(&escape(&importee.get_import_path(ctx.chunk, ctx.options.paths.as_ref())));
+          s.push_str(&escape(&importee.get_import_path(ctx.chunk, ctx.resolved_paths)));
           s.push_str(";\n");
           None
         }
@@ -387,7 +392,7 @@ where
       &ctx.link_output.module_table,
       specifiers,
       &default_alias,
-      &importee.get_import_path(ctx.chunk, ctx.options.paths.as_ref()),
+      &importee.get_import_path(ctx.chunk, ctx.resolved_paths),
       with_clause,
     ));
   }

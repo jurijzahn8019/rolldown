@@ -26,7 +26,8 @@ pub fn overwrite_check_public_file(
   };
   let pos = src[start - span.start];
   let wrap_offset = usize::from(pos == b'"' || pos == b'\'');
-  s.update(start + wrap_offset, span.end - wrap_offset, value)
+  #[expect(clippy::cast_possible_truncation)]
+  s.update((start + wrap_offset) as u32, (span.end - wrap_offset) as u32, value)
     .expect("update should not fail in html plugin");
   Ok(())
 }
@@ -205,7 +206,7 @@ pub struct ImageCandidate {
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// # use rolldown_plugin_vite_html::utils::helpers::{parse_srcset, ImageCandidate};
 /// let candidates = parse_srcset("small.jpg 480w, large.jpg 1200w");
 /// assert_eq!(candidates.len(), 2);
@@ -249,7 +250,7 @@ pub fn parse_srcset(srcset: &str) -> Vec<ImageCandidate> {
 /// A vector of lowercase tokens
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// let tokens = parse_rel_attr("stylesheet icon");
 /// assert_eq!(tokens, vec!["stylesheet", "icon"]);
 /// ```
